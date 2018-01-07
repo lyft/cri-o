@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kubernetes-incubator/cri-o/lib"
 	"golang.org/x/net/context"
 	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
@@ -16,5 +17,35 @@ func (s *Server) ContainerStats(ctx context.Context, req *pb.ContainerStatsReque
 		recordOperation(operation, time.Now())
 		recordError(operation, err)
 	}()
-	return nil, fmt.Errorf("not implemented")
+
+	container := s.GetContainer(req.ContainerId)
+	if container == nil {
+		return nil, fmt.Errorf("invalid container")
+	}
+
+	now := time.Now().UnixNano()
+	stats, err := s.GetContainerStats(container, &lib.ContainerStats{})
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.ContainerStatsResponse{
+		&pb.ContainerStats{
+			Attributes: &pb.ContainerAttributes{
+				Id:          req.ContainerId,
+				Metadata:    container.Metadata(),
+				Labels:      container.Labels(),
+				Annotations: container.Annotations(),
+			},
+			Cpu: &pb.CpuUsage{
+				Timestamp:            now,
+				UsageCoreNanoSeconds: &pb.UInt64Value{stats.CPUNano + stats.SystemNano},
+			},
+			Memory: &pb.MemoryUsage{
+				Timestamp:       now,
+				WorkingSetBytes: &pb.UInt64Value{stats.MemUsage},
+			},
+			WritableLayer: nil,
+		},
+	}, nil
 }

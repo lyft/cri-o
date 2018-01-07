@@ -15,8 +15,8 @@ import (
 type ContainerStats struct {
 	Container   string
 	CPU         float64
-	cpuNano     uint64
-	systemNano  uint64
+	CPUNano     uint64
+	SystemNano  uint64
 	MemUsage    uint64
 	MemLimit    uint64
 	MemPerc     float64
@@ -29,8 +29,8 @@ type ContainerStats struct {
 
 // GetContainerStats gets the running stats for a given container
 func (c *ContainerServer) GetContainerStats(ctr *oci.Container, previousStats *ContainerStats) (*ContainerStats, error) {
-	previousCPU := previousStats.cpuNano
-	previousSystem := previousStats.systemNano
+	previousCPU := previousStats.CPUNano
+	previousSystem := previousStats.SystemNano
 	libcontainerStats, err := c.LibcontainerStats(ctr)
 	if err != nil {
 		return nil, err
