@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"time"
 
 	"golang.org/x/net/context"
@@ -16,5 +15,13 @@ func (s *Server) ImageFsInfo(ctx context.Context, req *pb.ImageFsInfoRequest) (r
 		recordError(operation, err)
 	}()
 
-	return nil, fmt.Errorf("not implemented")
+	usage := pb.FilesystemUsage{
+		Timestamp:  time.Now().UnixNano(),
+		StorageId:  &pb.StorageIdentifier{"00000000-0000-0000-0000-000000000000"},
+		UsedBytes:  &pb.UInt64Value{0},
+		InodesUsed: &pb.UInt64Value{0},
+	}
+	return &pb.ImageFsInfoResponse{
+		ImageFilesystems: []*pb.FilesystemUsage{&usage},
+	}, nil
 }
