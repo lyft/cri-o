@@ -16,7 +16,7 @@ type ContainerStats struct {
 	Container   string
 	CPU         float64
 	CPUNano     uint64
-	SystemNano  uint64
+	SystemNano  int64
 	MemUsage    uint64
 	MemLimit    uint64
 	MemPerc     float64
@@ -38,6 +38,8 @@ func (c *ContainerServer) GetContainerStats(ctr *oci.Container, previousStats *C
 	cgroupStats := libcontainerStats.CgroupStats
 	stats := new(ContainerStats)
 	stats.Container = ctr.ID()
+	stats.CPUNano = cgroupStats.CpuStats.CpuUsage.TotalUsage
+	stats.SystemNano = time.Now().UnixNano()
 	stats.CPU = calculateCPUPercent(libcontainerStats, previousCPU, previousSystem)
 	stats.MemUsage = cgroupStats.MemoryStats.Usage.Usage
 	stats.MemLimit = getMemLimit(cgroupStats.MemoryStats.Usage.Limit)
@@ -84,11 +86,11 @@ func getContainerNetIO(stats *libcontainer.Stats) (received uint64, transmitted 
 	return
 }
 
-func calculateCPUPercent(stats *libcontainer.Stats, previousCPU, previousSystem uint64) float64 {
+func calculateCPUPercent(stats *libcontainer.Stats, previousCPU uint64, previousSystem int64) float64 {
 	var (
 		cpuPercent  = 0.0
 		cpuDelta    = float64(stats.CgroupStats.CpuStats.CpuUsage.TotalUsage - previousCPU)
-		systemDelta = float64(uint64(time.Now().UnixNano()) - previousSystem)
+		systemDelta = float64(uint64(time.Now().UnixNano()) - uint64(previousSystem))
 	)
 	if systemDelta > 0.0 && cpuDelta > 0.0 {
 		// gets a ratio of container cpu usage total, multiplies it by the number of cores (4 cores running

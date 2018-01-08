@@ -39,7 +39,7 @@ func (s *Server) ContainerStats(ctx context.Context, req *pb.ContainerStatsReque
 			},
 			Cpu: &pb.CpuUsage{
 				Timestamp:            now,
-				UsageCoreNanoSeconds: &pb.UInt64Value{stats.CPUNano + stats.SystemNano},
+				UsageCoreNanoSeconds: &pb.UInt64Value{stats.CPUNano},
 			},
 			Memory: &pb.MemoryUsage{
 				Timestamp:       now,
