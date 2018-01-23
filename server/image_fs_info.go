@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,13 +15,12 @@ import (
 	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
 	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
-	"strings"
 )
 
 func getStorageFsInfo(store storage.Store) (*pb.FilesystemUsage, error) {
-	rootPath := store.RunRoot()
+	rootPath := store.GraphRoot()
 	storageDriver := store.GraphDriverName()
-	filePath := path.Join(rootPath, storageDriver)
+	filePath := path.Join(rootPath, storageDriver + "-images")
 
 	statInfo := syscall.Stat_t{}
 	err := syscall.Lstat(filePath, &statInfo)
@@ -133,8 +133,12 @@ func (s *Server) ImageFsInfo(ctx context.Context, req *pb.ImageFsInfoRequest) (r
 	}()
 
 	store := s.StorageImageServer().GetStore()
-	fmt.Printf("%+v\n", store)
 	fsUsage, err := getStorageFsInfo(store)
+
+	if err != nil {
+		fmt.Printf("Failed to get fs usage: %s", err)
+		return nil, err
+	}
 
 	return &pb.ImageFsInfoResponse{
 		ImageFilesystems: []*pb.FilesystemUsage{fsUsage},
