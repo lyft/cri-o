@@ -25,7 +25,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const temporaryDirectoryForBigFiles = "/var/tmp" // Do not use the system default of os.TempDir(), usually /tmp, because with systemd it could be a tmpfs.
+var temporaryDirectoryForBigFiles = "/var/tmp" // Do not use the system default of os.TempDir(), usually /tmp, because with systemd it could be a tmpfs.
 
 var (
 	// ErrBlobDigestMismatch is returned when PutBlob() is given a blob
