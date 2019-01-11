@@ -28,7 +28,8 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run sleep 5
+	wait_until_exit "$ctr_id"
+	[ "$status" -eq 0 ]
 	run crictl inspect --output yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -54,7 +55,8 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run sleep 5
+	EXPECTED_EXIT_STATUS=1 wait_until_exit "$ctr_id"
+	[ "$status" -eq 0 ]
 	run crictl inspect --output yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -180,10 +182,7 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crictl stop "$ctr_id"
-	echo "$output"
-	# Ignore errors on stop.
-	run crictl inspect "$ctr_id"
+	run wait_until_exit "$ctr_id"
 	[ "$status" -eq 0 ]
 	run crictl rm "$ctr_id"
 	echo "$output"
@@ -227,10 +226,7 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crictl stop "$ctr_id"
-	echo "$output"
-	# Ignore errors on stop.
-	run crictl inspect "$ctr_id"
+	run wait_until_exit "$ctr_id"
 	[ "$status" -eq 0 ]
 	run crictl rm "$ctr_id"
 	echo "$output"
@@ -272,8 +268,7 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	sleep 6
-	run crictl inspect "$ctr_id"
+	run wait_until_exit "$ctr_id"
 	[ "$status" -eq 0 ]
 	run crictl rm "$ctr_id"
 	echo "$output"
@@ -316,10 +311,7 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crictl stop "$ctr_id"
-	echo "$output"
-	# Ignore errors on stop.
-	run crictl inspect "$ctr_id"
+	run wait_until_exit "$ctr_id"
 	[ "$status" -eq 0 ]
 	run crictl rm "$ctr_id"
 	echo "$output"
@@ -421,11 +413,11 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr1_id" ]]
-	run crictl ps --id "$ctr2_id" --podsandbox "$pod2_id" --quiet --all
+	run crictl ps --id "$ctr2_id" --pod "$pod2_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr2_id" ]]
-	run crictl ps --id "$ctr2_id" --podsandbox "$pod3_id" --quiet --all
+	run crictl ps --id "$ctr2_id" --pod "$pod3_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "" ]]
@@ -441,15 +433,15 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr3_id" ]]
-	run crictl ps --podsandbox "$pod1_id" --quiet --all
+	run crictl ps --pod "$pod1_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr1_id" ]]
-	run crictl ps --podsandbox "$pod2_id" --quiet --all
+	run crictl ps --pod "$pod2_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr2_id" ]]
-	run crictl ps --podsandbox "$pod3_id" --quiet --all
+	run crictl ps --pod "$pod3_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "$ctr3_id" ]]
@@ -882,20 +874,8 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	# Wait for container to exit
-	attempt=0
-	while [ $attempt -le 100 ]; do
-		attempt=$((attempt+1))
-		run crictl inspect "$ctr_id" --output table
-		echo "$output"
-		[ "$status" -eq 0 ]
-		if [[ "$output" =~ "State: CONTAINER_EXITED" ]]; then
-			[[ "$output" =~ "Exit Code: 0" ]]
-			break
-		fi
-		sleep 1
-	done
-
+	run wait_until_exit "$ctr_id"
+	[ "$status" -eq 0 ]
 	run crictl create "$pod_id" "$TESTDATA"/container_config_resolvconf_ro.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -903,19 +883,8 @@ function teardown() {
 	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	# Wait for container to exit
-	attempt=0
-	while [ $attempt -le 100 ]; do
-		attempt=$((attempt+1))
-		run crictl inspect "$ctr_id" --output table
-		echo "$output"
-		[ "$status" -eq 0 ]
-		if [[ "$output" =~ "State: CONTAINER_EXITED" ]]; then
-			break
-		fi
-		sleep 1
-	done
-
+	run wait_until_exit "$ctr_id"
+	[ "$status" -eq 0 ]
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio
@@ -1101,6 +1070,38 @@ function teardown() {
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "0" ]]
 
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr with non-root user has no effective capabilities" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+
+	newconfig=$(cat "$TESTDATA"/container_redis.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["linux"]["security_context"]["run_as_username"] = "redis"; json.dump(obj, sys.stdout)')
+	echo "$newconfig" > "$TESTDIR"/container_user.json
+
+	run crictl create "$pod_id" "$TESTDIR"/container_user.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	[ "$status" -eq 0 ]
+
+	run crictl exec --sync "$ctr_id" grep "CapEff:\s0000000000000000" /proc/1/status
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	run crictl stopp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl rmp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio

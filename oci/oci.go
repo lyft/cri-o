@@ -183,6 +183,7 @@ func (r *Runtime) CreateContainer(c *Container, cgroupParent string) (err error)
 	args = append(args, "-l", c.logPath)
 	args = append(args, "--exit-dir", r.containerExitsDir)
 	args = append(args, "--socket-dir-path", ContainerAttachSocketDir)
+	args = append(args, "--log-level", logrus.GetLevel().String())
 	if r.logSizeMax >= 0 {
 		args = append(args, "--log-size-max", fmt.Sprintf("%v", r.logSizeMax))
 	}
@@ -229,7 +230,7 @@ func (r *Runtime) CreateContainer(c *Container, cgroupParent string) (err error)
 
 	// Move conmon to specified cgroup
 	if r.cgroupManager == SystemdCgroupsManager {
-		logrus.Infof("Running conmon under slice %s and unitName %s", cgroupParent, createUnitName("crio-conmon", c.id))
+		logrus.Debugf("Running conmon under slice %s and unitName %s", cgroupParent, createUnitName("crio-conmon", c.id))
 		if err = utils.RunUnderSystemdScope(cmd.Process.Pid, cgroupParent, createUnitName("crio-conmon", c.id)); err != nil {
 			logrus.Warnf("Failed to add conmon to systemd sandbox cgroup: %v", err)
 		}
@@ -443,6 +444,7 @@ func (r *Runtime) ExecSync(c *Container, command []string, timeout int64) (resp 
 	}
 	args = append(args, "-l", logPath)
 	args = append(args, "--socket-dir-path", ContainerAttachSocketDir)
+	args = append(args, "--log-level", logrus.GetLevel().String())
 
 	processFile, err := PrepareProcessExec(c, command, c.terminal)
 	if err != nil {
@@ -509,7 +511,7 @@ func (r *Runtime) ExecSync(c *Container, command []string, timeout int64) (resp 
 		}
 	}
 
-	logrus.Infof("Received container exit code: %v, message: %s", ec.ExitCode, ec.Message)
+	logrus.Debugf("Received container exit code: %v, message: %s", ec.ExitCode, ec.Message)
 
 	if ec.ExitCode == -1 {
 		return nil, ExecSyncError{
@@ -820,18 +822,6 @@ func newPipe() (parent *os.File, child *os.File, err error) {
 		return nil, nil, err
 	}
 	return os.NewFile(uintptr(fds[1]), "parent"), os.NewFile(uintptr(fds[0]), "child"), nil
-}
-
-// RuntimeReady checks if the runtime is up and ready to accept
-// basic containers e.g. container only needs host network.
-func (r *Runtime) RuntimeReady() (bool, error) {
-	return true, nil
-}
-
-// NetworkReady checks if the runtime network is up and ready to
-// accept containers which require container network.
-func (r *Runtime) NetworkReady() (bool, error) {
-	return true, nil
 }
 
 // PauseContainer pauses a container.

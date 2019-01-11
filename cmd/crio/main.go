@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	goflag "flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -143,6 +144,9 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	if ctx.GlobalIsSet("image-volumes") {
 		config.ImageVolumes = lib.ImageVolumesType(ctx.GlobalString("image-volumes"))
 	}
+	if ctx.GlobalIsSet("log-level") {
+		config.LogLevel = ctx.GlobalString("log-level")
+	}
 	return nil
 }
 
@@ -174,6 +178,9 @@ func catchShutdown(gserver *grpc.Server, sserver *server.Server, hserver *http.S
 }
 
 func main() {
+	// https://github.com/kubernetes/kubernetes/issues/17162
+	goflag.CommandLine.Parse([]string{})
+
 	if reexec.Init() {
 		return
 	}
@@ -225,9 +232,9 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "log-level",
-			Usage: "log messages above specified level: debug, info (default), warn, error, fatal or panic",
+			Value: "error",
+			Usage: "log messages above specified level: debug, info, warn, error (default), fatal or panic",
 		},
-
 		cli.StringFlag{
 			Name:  "pause-command",
 			Usage: "name of the pause command in the pause image",
@@ -371,14 +378,11 @@ func main() {
 
 		logrus.SetFormatter(cf)
 
-		if loglevel := c.GlobalString("log-level"); loglevel != "" {
-			level, err := logrus.ParseLevel(loglevel)
-			if err != nil {
-				return err
-			}
-
-			logrus.SetLevel(level)
+		level, err := logrus.ParseLevel(config.LogLevel)
+		if err != nil {
+			return err
 		}
+		logrus.SetLevel(level)
 
 		if path := c.GlobalString("log"); path != "" {
 			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0666)

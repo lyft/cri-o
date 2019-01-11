@@ -9,6 +9,7 @@ before_install:
   - if [ "${TRAVIS_OS_NAME}" = linux ]; then sudo apt-get -qq update; fi
   - if [ "${TRAVIS_OS_NAME}" = linux ]; then sudo apt-get -qq install btrfs-tools libdevmapper-dev libgpgme11-dev libapparmor-dev libseccomp-dev; fi
   - if [ "${TRAVIS_OS_NAME}" = linux ]; then sudo apt-get -qq install autoconf automake bison e2fslibs-dev libfuse-dev libtool liblzma-dev gettext; fi
+  - if [ "${TRAVIS_OS_NAME}" = osx ]; then brew update && brew install gpgme; fi
 
 install:
   - make install.tools
@@ -36,16 +37,16 @@ jobs:
         - make .gitvalidation
         - make gofmt
         - make lint
-      go: tip
+      go: "1.10.x"
     - stage: Build and Verify
       script:
         - sudo "PATH=$PATH" make testunit
         - make
-      go: 1.8.x
+      go: "1.9.x"
     - script:
         - sudo "PATH=$PATH" make testunit
         - make
-      go: 1.9.x
+      go: "1.10.x"
     - script:
         - sudo "PATH=$PATH" make testunit
         - make
@@ -57,9 +58,10 @@ jobs:
     - stage: Integration Test
       script:
         - make integration
-      go: 1.9.x
+      go: "1.10.x"
   allow_failures:
     - os: osx
+    - go: tip
 
 notifications:
   irc: "chat.freenode.net#cri-o"

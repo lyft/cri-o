@@ -56,29 +56,53 @@
 		exit(EXIT_FAILURE);                                           \
 	} while (0)
 
-#define nwarn(s)                                             \
-	do {                                                 \
-		fprintf(stderr, "[conmon:w]: %s\n", s);      \
-		syslog(LOG_INFO, "conmon <nwarn>: %s\n", s); \
-	} while (0)
+#define nwarn(s)                                                     \
+	if (parse_level(opt_log_level) >= WARN_LEVEL) {                                     \
+		do {                                                 \
+			fprintf(stderr, "[conmon:w]: %s\n", s);      \
+			syslog(LOG_INFO, "conmon <nwarn>: %s\n", s); \
+		} while (0);                                         \
+	}
 
-#define nwarnf(fmt, ...)                                                       \
-	do {                                                                   \
-		fprintf(stderr, "[conmon:w]: " fmt "\n", ##__VA_ARGS__);       \
-		syslog(LOG_INFO, "conmon <nwarn>: " fmt " \n", ##__VA_ARGS__); \
-	} while (0)
+#define nwarnf(fmt, ...)                                                               \
+	if (parse_level(opt_log_level) >= WARN_LEVEL) {                                                       \
+		do {                                                                   \
+			fprintf(stderr, "[conmon:w]: " fmt "\n", ##__VA_ARGS__);       \
+			syslog(LOG_INFO, "conmon <nwarn>: " fmt " \n", ##__VA_ARGS__); \
+		} while (0);                                                           \
+	}
 
-#define ninfo(s)                                             \
-	do {                                                 \
-		fprintf(stderr, "[conmon:i]: %s\n", s);      \
-		syslog(LOG_INFO, "conmon <ninfo>: %s\n", s); \
-	} while (0)
+#define ninfo(s)                                                     \
+	if (parse_level(opt_log_level) >= INFO_LEVEL) {                                     \
+		do {                                                 \
+			fprintf(stderr, "[conmon:i]: %s\n", s);      \
+			syslog(LOG_INFO, "conmon <ninfo>: %s\n", s); \
+		} while (0);                                         \
+	}
 
-#define ninfof(fmt, ...)                                                       \
-	do {                                                                   \
-		fprintf(stderr, "[conmon:i]: " fmt "\n", ##__VA_ARGS__);       \
-		syslog(LOG_INFO, "conmon <ninfo>: " fmt " \n", ##__VA_ARGS__); \
-	} while (0)
+#define ninfof(fmt, ...)                                                               \
+	if (parse_level(opt_log_level) >= INFO_LEVEL) {                                                       \
+		do {                                                                   \
+			fprintf(stderr, "[conmon:i]: " fmt "\n", ##__VA_ARGS__);       \
+			syslog(LOG_INFO, "conmon <ninfo>: " fmt " \n", ##__VA_ARGS__); \
+		} while (0);                                                           \
+	}
+
+#define ndebug(s)                                                     \
+	if (parse_level(opt_log_level) >= DEBUG_LEVEL) {                                      \
+		do {                                                  \
+			fprintf(stderr, "[conmon:d]: %s\n", s);       \
+			syslog(LOG_INFO, "conmon <ndebug>: %s\n", s); \
+		} while (0);                                          \
+	}
+
+#define ndebugf(fmt, ...)                                                               \
+	if (parse_level(opt_log_level) >= DEBUG_LEVEL) {                                                        \
+		do {                                                                    \
+			fprintf(stderr, "[conmon:d]: " fmt "\n", ##__VA_ARGS__);        \
+			syslog(LOG_INFO, "conmon <ndebug>: " fmt " \n", ##__VA_ARGS__); \
+		} while (0);                                                            \
+	}
 
 #define _cleanup_(x) __attribute__((cleanup(x)))
 
@@ -146,6 +170,7 @@ static bool opt_no_new_keyring = false;
 static char *opt_exit_command = NULL;
 static gchar **opt_exit_args = NULL;
 static bool opt_replace_listen_pid = false;
+static char *opt_log_level = NULL;
 static GOptionEntry opt_entries[] =
 {
   { "terminal", 't', 0, G_OPTION_ARG_NONE, &opt_terminal, "Terminal", NULL },
@@ -171,8 +196,32 @@ static GOptionEntry opt_entries[] =
   { "log-size-max", 0, 0, G_OPTION_ARG_INT64, &opt_log_size_max, "Maximum size of log file", NULL },
   { "socket-dir-path", 0, 0, G_OPTION_ARG_STRING, &opt_socket_path, "Location of container attach sockets", NULL },
   { "version", 0, 0, G_OPTION_ARG_NONE, &opt_version, "Print the version and exit", NULL },
+  { "log-level", 0, 0, G_OPTION_ARG_STRING, &opt_log_level, "Print debug logs based on log level", NULL },
   { NULL }
 };
+
+/* Different levels of logging */
+typedef enum{
+	EXIT_LEVEL,
+	WARN_LEVEL,
+	INFO_LEVEL,
+	DEBUG_LEVEL,
+} log_level_t;
+
+/* Parse_level parses the string value of the --log_level flag to its matching enum */
+static log_level_t parse_level(char *level_name) {
+	if (!strcmp(level_name, "error") || !strcmp(level_name, "fatal") || !strcmp(level_name, "panic")) {
+		return EXIT_LEVEL;
+	} else if (!strcmp(level_name, "warn") || !strcmp(level_name, "warning")) {
+		return WARN_LEVEL;
+	} else if (!strcmp(level_name, "info")) {
+		return INFO_LEVEL;
+	} else if (!strcmp(level_name, "debug")) {
+		return DEBUG_LEVEL;
+	} else {
+		nexitf("No such log level %s", level_name);
+	}
+}
 
 /* strlen("1997-03-25T13:20:42.999999999+01:00 stdout ") + 1 */
 #define TSBUFLEN 44
@@ -232,6 +281,7 @@ static ssize_t writev_buffer_flush (int fd, writev_buffer_t *buf)
 		while (res > 0) {
 			size_t from_this = MIN((size_t)res, iov->iov_len);
 			iov->iov_len -= from_this;
+			iov->iov_base += from_this;
 			res -= from_this;
 
 			if (iov->iov_len == 0) {
@@ -395,6 +445,14 @@ static int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen
 		if ((opt_log_size_max > 0) && (bytes_written + bytes_to_be_written) > opt_log_size_max) {
 			bytes_written = 0;
 
+			if (writev_buffer_flush(fd, &bufv) < 0) {
+				nwarn("failed to flush buffer to log");
+				/*
+				 * We are going to reopen the file anyway, in case of
+				 * errors discard all we have in the buffer.
+				 */
+				bufv.iovcnt = 0;
+			}
 			reopen_log_file();
 
 			/* Reassign to the new log file fd */
@@ -988,7 +1046,9 @@ runtime_exit_cb (G_GNUC_UNUSED GPid pid, int status, G_GNUC_UNUSED gpointer user
 static void
 container_exit_cb (G_GNUC_UNUSED GPid pid, int status, G_GNUC_UNUSED gpointer user_data)
 {
-	ninfof("container %d exited with status %d", pid, status);
+	if (status != 0) {
+		ninfof("container %d exited with status %d", pid, status);
+	}
 	container_status = status;
 	container_pid = -1;
 	g_main_loop_quit (main_loop);
@@ -1526,7 +1586,6 @@ int main(int argc, char *argv[])
 	if (signal(SIGCHLD, on_sigchld) == SIG_ERR)
 		pexit("Failed to set handler for SIGCHLD");
 
-	ninfof("about to waitpid: %d", create_pid);
 	if (csname != NULL) {
 		guint terminal_watch = g_unix_fd_add (console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
 		/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
@@ -1575,7 +1634,7 @@ int main(int argc, char *argv[])
 	}
 
 	container_pid = atoi(contents);
-	ninfof("container PID: %d", container_pid);
+	ndebugf("container PID: %d", container_pid);
 
 	g_hash_table_insert (pid_to_handler, (pid_t *) &container_pid, container_exit_cb);
 
@@ -1611,13 +1670,13 @@ int main(int argc, char *argv[])
 
 	g_main_loop_run (main_loop);
 
-	/* Drain stdout and stderr */
-	if (masterfd_stdout != -1) {
+	/* Drain stdout and stderr only if a timeout doesn't occur */
+	if (masterfd_stdout != -1 && !timed_out) {
 		g_unix_set_fd_nonblocking(masterfd_stdout, TRUE, NULL);
 		while (read_stdio(masterfd_stdout, STDOUT_PIPE, NULL))
 			;
 	}
-	if (masterfd_stderr != -1) {
+	if (masterfd_stderr != -1 && !timed_out) {
 		g_unix_set_fd_nonblocking(masterfd_stderr, TRUE, NULL);
 		while (read_stdio(masterfd_stderr, STDERR_PIPE, NULL))
 			;

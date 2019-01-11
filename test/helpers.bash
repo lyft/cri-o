@@ -158,7 +158,7 @@ function crio() {
 
 # Run crictl using the binary specified by $CRICTL_BINARY.
 function crictl() {
-	"$CRICTL_BINARY" -r "$CRIO_SOCKET" -i "$CRIO_SOCKET" "$@"
+	"$CRICTL_BINARY" -r "unix://$CRIO_SOCKET" -i "unix://$CRIO_SOCKET" "$@"
 }
 
 # Communicate with Docker on the host machine.
@@ -232,8 +232,8 @@ function start_crio() {
 	if [ "$status" -ne 0 ] ; then
 		crictl pull redis:alpine
 	fi
-	REDIS_IMAGEID=$(crictl inspecti redis:alpine --output table | grep ^ID: | head -n 1 | sed -e "s/ID: //g")
-	REDIS_IMAGEREF=$(crictl inspecti redis:alpine --output table | grep ^Digest: | head -n 1 | sed -e "s/Digest: //g")
+	REDIS_IMAGEID=$(crictl inspecti --output=table redis:alpine | grep ^ID: | head -n 1 | sed -e "s/ID: //g")
+	REDIS_IMAGEREF=$(crictl inspecti --output=table redis:alpine | grep ^Digest: | head -n 1 | sed -e "s/Digest: //g")
 	run crictl inspecti mrunalp/oom
 	if [ "$status" -ne 0 ] ; then
 		  crictl pull mrunalp/oom
@@ -318,10 +318,20 @@ function restart_crio() {
 	fi
 }
 
+function cleanup_lvm() {
+	if [ "$LVM_DEVICE" != "" ]; then
+		lvm lvremove -y storage/thinpool
+		lvm vgremove -y storage
+		lvm pvremove -y $LVM_DEVICE
+	fi
+}
+
+
 function cleanup_test() {
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio
+	cleanup_lvm
 	rm -rf "$TESTDIR"
 }
 
@@ -373,23 +383,16 @@ function prepare_network_conf() {
 }
 EOF
 
-	cat >$CRIO_CNI_CONFIG/99-loopback.conf <<-EOF
-{
-    "cniVersion": "0.2.0",
-    "type": "loopback"
-}
-EOF
-
 	echo 0
 }
 
-function prepare_plugin_test_args_network_conf() {
+function write_plugin_test_args_network_conf() {
 	mkdir -p $CRIO_CNI_CONFIG
 	cat >$CRIO_CNI_CONFIG/10-plugin-test-args.conf <<-EOF
 {
     "cniVersion": "0.2.0",
     "name": "crionet_test_args",
-    "type": "bridge-custom",
+    "type": "cni_plugin_helper.bash",
     "bridge": "cni0",
     "isGateway": true,
     "ipMasq": true,
@@ -403,7 +406,19 @@ function prepare_plugin_test_args_network_conf() {
 }
 EOF
 
+	if [[ -n "$2" ]]; then
+		echo "DEBUG_ARGS=$2" > /tmp/cni_plugin_helper_input.env
+	fi
+
 	echo 0
+}
+
+function prepare_plugin_test_args_network_conf() {
+	write_plugin_test_args_network_conf $1 ""
+}
+
+function prepare_plugin_test_args_network_conf_malformed_result() {
+	write_plugin_test_args_network_conf $1 "malformed-result"
 }
 
 function check_pod_cidr() {
@@ -461,4 +476,22 @@ function cleanup_network_conf() {
 
 function temp_sandbox_conf() {
 	sed -e s/\"namespace\":.*/\"namespace\":\ \"$1\",/g "$TESTDATA"/sandbox_config.json > $TESTDIR/sandbox_config_$1.json
+}
+
+function wait_until_exit() {
+	ctr_id=$1
+	# Wait for container to exit
+	attempt=0
+	while [ $attempt -le 100 ]; do
+		attempt=$((attempt+1))
+		run crictl inspect "$ctr_id" --output table
+		echo "$output"
+		[ "$status" -eq 0 ]
+		if [[ "$output" =~ "State: CONTAINER_EXITED" ]]; then
+			[[ "$output" =~ "Exit Code: ${EXPECTED_EXIT_STATUS:-0}" ]]
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
 }

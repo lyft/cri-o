@@ -135,8 +135,7 @@ func addOCIBindMounts(mountLabel string, containerConfig *pb.ContainerConfig, sp
 		}
 
 		if mount.SelinuxRelabel {
-			// Need a way in kubernetes to determine if the volume is shared or private
-			if err := label.Relabel(src, mountLabel, true); err != nil && err != unix.ENOTSUP {
+			if err := label.Relabel(src, mountLabel, false); err != nil && err != unix.ENOTSUP {
 				return nil, nil, fmt.Errorf("relabel failed %s: %v", src, err)
 			}
 		}
@@ -254,7 +253,8 @@ func addImageVolumes(rootfs string, s *Server, containerInfo *storage.ContainerI
 			mounts = append(mounts, rspec.Mount{
 				Source:      src,
 				Destination: dest,
-				Options:     []string{"rw"},
+				Type:        "bind",
+				Options:     []string{"private", "bind", "rw"},
 			})
 
 		case lib.ImageVolumesIgnore:
@@ -424,7 +424,7 @@ func buildOCIProcessArgs(containerKubeConfig *pb.ContainerConfig, imageOCIConfig
 
 // addOCIHook look for hooks programs installed in hooksDirPath and add them to spec
 func addOCIHook(specgen *generate.Generator, hook lib.HookParams) error {
-	logrus.Debugf("AddOCIHook", hook)
+	logrus.Debugf("AddOCIHook %s", hook.Hook)
 	for _, stage := range hook.Stage {
 		h := rspec.Hook{
 			Path: hook.Hook,
@@ -464,6 +464,13 @@ func setupContainerUser(specgen *generate.Generator, rootfs string, sc *pb.Linux
 					}
 				}
 			}
+		}
+		if sc.GetRunAsUser() == nil && sc.GetRunAsUsername() == "" && sc.GetRunAsGroup() != nil {
+			return fmt.Errorf("RunAsGroup should be specified only with RunAsUser or RunAsUsername")
+		}
+		groupstr := strconv.FormatInt(sc.GetRunAsGroup().GetValue(), 10)
+		if groupstr != "" {
+			containerUser = containerUser + ":" + groupstr
 		}
 
 		logrus.Debugf("CONTAINER USER: %+v", containerUser)
@@ -551,6 +558,9 @@ func setupCapabilities(specgen *generate.Generator, capabilities *pb.Capability)
 			continue
 		}
 		capPrefixed := toCAPPrefixed(cap)
+		if !inStringSlice(getOCICapabilitiesList(), capPrefixed) {
+			return fmt.Errorf("unknown capability %q to add", capPrefixed)
+		}
 		if err := specgen.AddProcessCapabilityBounding(capPrefixed); err != nil {
 			return err
 		}
@@ -695,14 +705,25 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}()
 
-	if err = s.Runtime().CreateContainer(container, sb.CgroupParent()); err != nil {
-		return nil, err
-	}
-
 	s.addContainer(container)
+	defer func() {
+		if err != nil {
+			s.removeContainer(container)
+		}
+	}()
 
 	if err = s.CtrIDIndex().Add(containerID); err != nil {
-		s.removeContainer(container)
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			if err2 := s.CtrIDIndex().Delete(containerID); err2 != nil {
+				logrus.Warnf("couldn't delete ctr id %s from idIndex", containerID)
+			}
+		}
+	}()
+
+	if err = s.Runtime().CreateContainer(container, sb.CgroupParent()); err != nil {
 		return nil, err
 	}
 
@@ -730,7 +751,7 @@ func (s *Server) setupOCIHooks(specgen *generate.Generator, sb *sandbox.Sandbox,
 		return nil
 	}
 	for _, hook := range s.Hooks() {
-		logrus.Debugf("SetupOCIHooks", hook)
+		logrus.Debugf("SetupOCIHooks: %s", hook.Hook)
 		if hook.HasBindMounts && len(mounts) > 0 {
 			if err := addHook(hook); err != nil {
 				return err
@@ -794,11 +815,15 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID string,
 	var readOnlyRootfs bool
 	var privileged bool
 	if containerConfig.GetLinux().GetSecurityContext() != nil {
-		if containerConfig.GetLinux().GetSecurityContext().Privileged {
+		if containerConfig.GetLinux().GetSecurityContext().GetPrivileged() {
 			privileged = true
 		}
-
-		if containerConfig.GetLinux().GetSecurityContext().ReadonlyRootfs {
+		if privileged {
+			if !sandboxConfig.GetLinux().GetSecurityContext().GetPrivileged() {
+				return nil, errors.New("no privileged container allowed in sandbox")
+			}
+		}
+		if containerConfig.GetLinux().GetSecurityContext().GetReadonlyRootfs() {
 			readOnlyRootfs = true
 			specgen.SetRootReadonly(true)
 		}
@@ -952,7 +977,9 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID string,
 		if containerConfig.GetLinux().GetSecurityContext() != nil &&
 			!containerConfig.GetLinux().GetSecurityContext().Privileged {
 			for _, mp := range []string{
+				"/proc/acpi",
 				"/proc/kcore",
+				"/proc/keys",
 				"/proc/latency_stats",
 				"/proc/timer_list",
 				"/proc/timer_stats",
@@ -1073,7 +1100,7 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID string,
 		options = []string{"ro"}
 	}
 	if sb.ResolvPath() != "" {
-		if err := label.Relabel(sb.ResolvPath(), mountLabel, true); err != nil && err != unix.ENOTSUP {
+		if err := label.Relabel(sb.ResolvPath(), mountLabel, false); err != nil && err != unix.ENOTSUP {
 			return nil, err
 		}
 
@@ -1088,7 +1115,7 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID string,
 	}
 
 	if sb.HostnamePath() != "" {
-		if err := label.Relabel(sb.HostnamePath(), mountLabel, true); err != nil && err != unix.ENOTSUP {
+		if err := label.Relabel(sb.HostnamePath(), mountLabel, false); err != nil && err != unix.ENOTSUP {
 			return nil, err
 		}
 
@@ -1406,7 +1433,7 @@ func setOCIBindMountsPrivileged(g *generate.Generator) {
 	spec := g.Spec()
 	// clear readonly for /sys and cgroup
 	for i, m := range spec.Mounts {
-		if spec.Mounts[i].Destination == "/sys" && !spec.Root.Readonly {
+		if spec.Mounts[i].Destination == "/sys" {
 			clearReadOnly(&spec.Mounts[i])
 		}
 		if m.Type == "cgroup" {
@@ -1424,7 +1451,7 @@ func clearReadOnly(m *rspec.Mount) {
 			opt = append(opt, o)
 		}
 	}
-	m.Options = opt
+	m.Options = append(opt, "rw")
 }
 
 func setupWorkingDirectory(rootfs, mountLabel, containerCwd string) error {
@@ -1436,7 +1463,7 @@ func setupWorkingDirectory(rootfs, mountLabel, containerCwd string) error {
 		return err
 	}
 	if mountLabel != "" {
-		if err1 := label.Relabel(fp, mountLabel, true); err1 != nil && err1 != unix.ENOTSUP {
+		if err1 := label.Relabel(fp, mountLabel, false); err1 != nil && err1 != unix.ENOTSUP {
 			return fmt.Errorf("relabel failed %s: %v", fp, err1)
 		}
 	}
