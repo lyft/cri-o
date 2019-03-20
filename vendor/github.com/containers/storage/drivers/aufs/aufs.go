@@ -42,6 +42,7 @@ import (
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/locker"
 	mountpk "github.com/containers/storage/pkg/mount"
+	"github.com/containers/storage/pkg/parsers"
 	"github.com/containers/storage/pkg/system"
 	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/selinux/go-selinux/label"
@@ -77,6 +78,7 @@ type Driver struct {
 	pathCache     map[string]string
 	naiveDiff     graphdriver.DiffDriver
 	locker        *locker.Locker
+	mountOptions  string
 }
 
 // Init returns a new AUFS driver.
@@ -103,6 +105,20 @@ func Init(root string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, errors.Wrapf(graphdriver.ErrIncompatibleFS, "AUFS is not supported over %q", backingFs)
 	}
 
+	var mountOptions string
+	for _, option := range options {
+		key, val, err := parsers.ParseKeyValueOpt(option)
+		if err != nil {
+			return nil, err
+		}
+		key = strings.ToLower(key)
+		switch key {
+		case "aufs.mountopt":
+			mountOptions = val
+		default:
+			return nil, fmt.Errorf("option %s not supported", option)
+		}
+	}
 	paths := []string{
 		"mnt",
 		"diff",
@@ -110,12 +126,13 @@ func Init(root string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 	}
 
 	a := &Driver{
-		root:      root,
-		uidMaps:   uidMaps,
-		gidMaps:   gidMaps,
-		pathCache: make(map[string]string),
-		ctr:       graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicAufs)),
-		locker:    locker.New(),
+		root:         root,
+		uidMaps:      uidMaps,
+		gidMaps:      gidMaps,
+		pathCache:    make(map[string]string),
+		ctr:          graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicAufs)),
+		locker:       locker.New(),
+		mountOptions: mountOptions,
 	}
 
 	rootUID, rootGID, err := idtools.GetRootUIDGID(uidMaps, gidMaps)
@@ -167,7 +184,7 @@ func Init(root string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		}
 	}
 
-	a.naiveDiff = graphdriver.NewNaiveDiffDriver(a, uidMaps, gidMaps)
+	a.naiveDiff = graphdriver.NewNaiveDiffDriver(a, a)
 	return a, nil
 }
 
@@ -236,6 +253,11 @@ func (a *Driver) AdditionalImageStores() []string {
 	return nil
 }
 
+// CreateFromTemplate creates a layer with the same contents and parent as another layer.
+func (a *Driver) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
+	return graphdriver.NaiveCreateFromTemplate(a, id, template, templateIDMappings, parent, parentIDMappings, opts, readWrite)
+}
+
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
 func (a *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
@@ -250,7 +272,7 @@ func (a *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 		return fmt.Errorf("--storage-opt is not supported for aufs")
 	}
 
-	if err := a.createDirsFor(id); err != nil {
+	if err := a.createDirsFor(id, parent); err != nil {
 		return err
 	}
 	// Write the layers metadata
@@ -281,21 +303,26 @@ func (a *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 
 // createDirsFor creates two directories for the given id.
 // mnt and diff
-func (a *Driver) createDirsFor(id string) error {
+func (a *Driver) createDirsFor(id, parent string) error {
 	paths := []string{
 		"mnt",
 		"diff",
 	}
 
-	rootUID, rootGID, err := idtools.GetRootUIDGID(a.uidMaps, a.gidMaps)
-	if err != nil {
-		return err
-	}
 	// Directory permission is 0755.
 	// The path of directories are <aufs_root_path>/mnt/<image_id>
 	// and <aufs_root_path>/diff/<image_id>
 	for _, p := range paths {
-		if err := idtools.MkdirAllAs(path.Join(a.rootPath(), p, id), 0755, rootUID, rootGID); err != nil {
+		rootPair := idtools.NewIDMappingsFromMaps(a.uidMaps, a.gidMaps).RootPair()
+		if parent != "" {
+			st, err := system.Stat(path.Join(a.rootPath(), p, parent))
+			if err != nil {
+				return err
+			}
+			rootPair.UID = int(st.UID())
+			rootPair.GID = int(st.GID())
+		}
+		if err := idtools.MkdirAllAndChownNew(path.Join(a.rootPath(), p, id), os.FileMode(0755), rootPair); err != nil {
 			return err
 		}
 	}
@@ -383,7 +410,7 @@ func atomicRemove(source string) error {
 	case os.IsExist(err):
 		// Got error saying the target dir already exists, maybe the source doesn't exist due to a previous (failed) remove
 		if _, e := os.Stat(source); !os.IsNotExist(e) {
-			return errors.Wrapf(err, "target rename dir '%s' exists but should not, this needs to be manually cleaned up")
+			return errors.Wrapf(err, "target rename dir '%s' exists but should not, this needs to be manually cleaned up", target)
 		}
 	default:
 		return errors.Wrapf(err, "error preparing atomic delete")
@@ -394,7 +421,7 @@ func atomicRemove(source string) error {
 
 // Get returns the rootfs path for the id.
 // This will mount the dir at its given path
-func (a *Driver) Get(id, mountLabel string) (string, error) {
+func (a *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	a.locker.Lock(id)
 	defer a.locker.Unlock(id)
 	parents, err := a.getParentLayerPaths(id)
@@ -419,7 +446,7 @@ func (a *Driver) Get(id, mountLabel string) (string, error) {
 	// If a dir does not have a parent ( no layers )do not try to mount
 	// just return the diff path to the data
 	if len(parents) > 0 {
-		if err := a.mount(id, m, mountLabel, parents); err != nil {
+		if err := a.mount(id, m, parents, options); err != nil {
 			return "", err
 		}
 	}
@@ -463,17 +490,21 @@ func (a *Driver) isParent(id, parent string) bool {
 
 // Diff produces an archive of the changes between the specified
 // layer and its parent layer which may be "".
-func (a *Driver) Diff(id, parent, mountLabel string) (io.ReadCloser, error) {
+func (a *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (io.ReadCloser, error) {
 	if !a.isParent(id, parent) {
-		return a.naiveDiff.Diff(id, parent, mountLabel)
+		return a.naiveDiff.Diff(id, idMappings, parent, parentMappings, mountLabel)
+	}
+
+	if idMappings == nil {
+		idMappings = &idtools.IDMappings{}
 	}
 
 	// AUFS doesn't need the parent layer to produce a diff.
 	return archive.TarWithOptions(path.Join(a.rootPath(), "diff", id), &archive.TarOptions{
 		Compression:     archive.Uncompressed,
 		ExcludePatterns: []string{archive.WhiteoutMetaPrefix + "*", "!" + archive.WhiteoutOpaqueDir},
-		UIDMaps:         a.uidMaps,
-		GIDMaps:         a.gidMaps,
+		UIDMaps:         idMappings.UIDs(),
+		GIDMaps:         idMappings.GIDs(),
 	})
 }
 
@@ -492,19 +523,22 @@ func (a *Driver) DiffGetter(id string) (graphdriver.FileGetCloser, error) {
 	return fileGetNilCloser{storage.NewPathFileGetter(p)}, nil
 }
 
-func (a *Driver) applyDiff(id string, diff io.Reader) error {
+func (a *Driver) applyDiff(id string, idMappings *idtools.IDMappings, diff io.Reader) error {
+	if idMappings == nil {
+		idMappings = &idtools.IDMappings{}
+	}
 	return chrootarchive.UntarUncompressed(diff, path.Join(a.rootPath(), "diff", id), &archive.TarOptions{
-		UIDMaps: a.uidMaps,
-		GIDMaps: a.gidMaps,
+		UIDMaps: idMappings.UIDs(),
+		GIDMaps: idMappings.GIDs(),
 	})
 }
 
 // DiffSize calculates the changes between the specified id
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
-func (a *Driver) DiffSize(id, parent, mountLabel string) (size int64, err error) {
+func (a *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (size int64, err error) {
 	if !a.isParent(id, parent) {
-		return a.naiveDiff.DiffSize(id, parent, mountLabel)
+		return a.naiveDiff.DiffSize(id, idMappings, parent, parentMappings, mountLabel)
 	}
 	// AUFS doesn't need the parent layer to calculate the diff size.
 	return directory.Size(path.Join(a.rootPath(), "diff", id))
@@ -513,24 +547,24 @@ func (a *Driver) DiffSize(id, parent, mountLabel string) (size int64, err error)
 // ApplyDiff extracts the changeset from the given diff into the
 // layer with the specified id and parent, returning the size of the
 // new layer in bytes.
-func (a *Driver) ApplyDiff(id, parent, mountLabel string, diff io.Reader) (size int64, err error) {
+func (a *Driver) ApplyDiff(id string, idMappings *idtools.IDMappings, parent, mountLabel string, diff io.Reader) (size int64, err error) {
 	if !a.isParent(id, parent) {
-		return a.naiveDiff.ApplyDiff(id, parent, mountLabel, diff)
+		return a.naiveDiff.ApplyDiff(id, idMappings, parent, mountLabel, diff)
 	}
 
 	// AUFS doesn't need the parent id to apply the diff if it is the direct parent.
-	if err = a.applyDiff(id, diff); err != nil {
+	if err = a.applyDiff(id, idMappings, diff); err != nil {
 		return
 	}
 
-	return a.DiffSize(id, parent, mountLabel)
+	return directory.Size(path.Join(a.rootPath(), "diff", id))
 }
 
 // Changes produces a list of changes between the specified layer
 // and its parent layer. If parent is "", then all changes will be ADD changes.
-func (a *Driver) Changes(id, parent, mountLabel string) ([]archive.Change, error) {
+func (a *Driver) Changes(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) ([]archive.Change, error) {
 	if !a.isParent(id, parent) {
-		return a.naiveDiff.Changes(id, parent, mountLabel)
+		return a.naiveDiff.Changes(id, idMappings, parent, parentMappings, mountLabel)
 	}
 
 	// AUFS doesn't have snapshots, so we need to get changes from all parent
@@ -556,7 +590,7 @@ func (a *Driver) getParentLayerPaths(id string) ([]string, error) {
 	return layers, nil
 }
 
-func (a *Driver) mount(id string, target string, mountLabel string, layers []string) error {
+func (a *Driver) mount(id string, target string, layers []string, options graphdriver.MountOpts) error {
 	a.Lock()
 	defer a.Unlock()
 
@@ -567,7 +601,7 @@ func (a *Driver) mount(id string, target string, mountLabel string, layers []str
 
 	rw := a.getDiffPath(id)
 
-	if err := a.aufsMount(layers, rw, target, mountLabel); err != nil {
+	if err := a.aufsMount(layers, rw, target, options); err != nil {
 		return fmt.Errorf("error creating aufs mount to %s: %v", target, err)
 	}
 	return nil
@@ -614,7 +648,7 @@ func (a *Driver) Cleanup() error {
 	return mountpk.Unmount(a.root)
 }
 
-func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err error) {
+func (a *Driver) aufsMount(ro []string, rw, target string, options graphdriver.MountOpts) (err error) {
 	defer func() {
 		if err != nil {
 			Unmount(target)
@@ -628,7 +662,7 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 	if useDirperm() {
 		offset += len(",dirperm1")
 	}
-	b := make([]byte, unix.Getpagesize()-len(mountLabel)-offset) // room for xino & mountLabel
+	b := make([]byte, unix.Getpagesize()-len(options.MountLabel)-offset) // room for xino & mountLabel
 	bp := copy(b, fmt.Sprintf("br:%s=rw", rw))
 
 	index := 0
@@ -641,17 +675,25 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 	}
 
 	opts := "dio,xino=/dev/shm/aufs.xino"
+	mountOptions := a.mountOptions
+	if len(options.Options) > 0 {
+		mountOptions = strings.Join(options.Options, ",")
+	}
+	if mountOptions != "" {
+		opts += fmt.Sprintf(",%s", mountOptions)
+	}
+
 	if useDirperm() {
 		opts += ",dirperm1"
 	}
-	data := label.FormatMountLabel(fmt.Sprintf("%s,%s", string(b[:bp]), opts), mountLabel)
+	data := label.FormatMountLabel(fmt.Sprintf("%s,%s", string(b[:bp]), opts), options.MountLabel)
 	if err = mount("none", target, "aufs", 0, data); err != nil {
 		return
 	}
 
 	for ; index < len(ro); index++ {
 		layer := fmt.Sprintf(":%s=ro+wh", ro[index])
-		data := label.FormatMountLabel(fmt.Sprintf("append%s", layer), mountLabel)
+		data := label.FormatMountLabel(fmt.Sprintf("append%s", layer), options.MountLabel)
 		if err = mount("none", target, "aufs", unix.MS_REMOUNT, data); err != nil {
 			return
 		}
@@ -688,4 +730,15 @@ func useDirperm() bool {
 		}
 	})
 	return enableDirperm
+}
+
+// UpdateLayerIDMap updates ID mappings in a layer from matching the ones
+// specified by toContainer to those specified by toHost.
+func (a *Driver) UpdateLayerIDMap(id string, toContainer, toHost *idtools.IDMappings, mountLabel string) error {
+	return fmt.Errorf("aufs doesn't support changing ID mappings")
+}
+
+// SupportsShifting tells whether the driver support shifting of the UIDs/GIDs in an userNS
+func (a *Driver) SupportsShifting() bool {
+	return false
 }

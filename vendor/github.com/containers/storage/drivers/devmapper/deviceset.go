@@ -703,6 +703,10 @@ func (devices *DeviceSet) startDeviceDeletionWorker() {
 		return
 	}
 
+	// Cleanup right away if there are any leaked devices.  Note this
+	// could cause some slowdown for process startup, if there were
+	// Leaked devices
+	devices.cleanupDeletedDevices()
 	logrus.Debug("devmapper: Worker to cleanup deleted devices started")
 	for range devices.deletionWorkerTicker.C {
 		devices.cleanupDeletedDevices()
@@ -2360,7 +2364,7 @@ func (devices *DeviceSet) xfsSetNospaceRetries(info *devInfo) error {
 }
 
 // MountDevice mounts the device if not already mounted.
-func (devices *DeviceSet) MountDevice(hash, path, mountLabel string) error {
+func (devices *DeviceSet) MountDevice(hash, path string, moptions graphdriver.MountOpts) error {
 	info, err := devices.lookupDeviceWithLock(hash)
 	if err != nil {
 		return err
@@ -2392,8 +2396,17 @@ func (devices *DeviceSet) MountDevice(hash, path, mountLabel string) error {
 		options = joinMountOptions(options, "nouuid")
 	}
 
-	options = joinMountOptions(options, devices.mountOptions)
-	options = joinMountOptions(options, label.FormatMountLabel("", mountLabel))
+	mountOptions := devices.mountOptions
+	if len(moptions.Options) > 0 {
+		addNouuid := strings.Contains("nouuid", mountOptions)
+		mountOptions = strings.Join(moptions.Options, ",")
+		if addNouuid {
+			mountOptions = fmt.Sprintf("nouuid,%s", mountOptions)
+		}
+	}
+
+	options = joinMountOptions(options, mountOptions)
+	options = joinMountOptions(options, label.FormatMountLabel("", moptions.MountLabel))
 
 	if err := mount.Mount(info.DevName(), path, fstype, options); err != nil {
 		return fmt.Errorf("devmapper: Error mounting '%s' on '%s': %s\n%v", info.DevName(), path, err, string(dmesg.Dmesg(256)))
@@ -2652,6 +2665,7 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 
 	foundBlkDiscard := false
 	var lvmSetupConfig directLVMConfig
+	testMode := false
 	for _, option := range options {
 		key, val, err := parsers.ParseKeyValueOpt(option)
 		if err != nil {
@@ -2685,7 +2699,7 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 			devices.filesystem = val
 		case "dm.mkfsarg":
 			devices.mkfsArgs = append(devices.mkfsArgs, val)
-		case "dm.mountopt":
+		case "dm.mountopt", "devicemapper.mountopt":
 			devices.mountOptions = joinMountOptions(devices.mountOptions, val)
 		case "dm.metadatadev":
 			devices.metadataDevice = val
@@ -2801,13 +2815,20 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 			devicemapper.LogInit(devicemapper.DefaultLogger{
 				Level: int(level),
 			})
+		case "test":
+			testMode, err = strconv.ParseBool(val)
+			if err != nil {
+				return nil, err
+			}
 		default:
 			return nil, fmt.Errorf("devmapper: Unknown option %s", key)
 		}
 	}
 
-	if err := validateLVMConfig(lvmSetupConfig); err != nil {
-		return nil, err
+	if !testMode {
+		if err := validateLVMConfig(lvmSetupConfig); err != nil {
+			return nil, err
+		}
 	}
 
 	devices.lvmSetupConfig = lvmSetupConfig
