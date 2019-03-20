@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -205,13 +206,13 @@ func (r *runtimeService) createContainerOrPodSandbox(systemContext *types.System
 	}
 
 	// Pull out a copy of the image's configuration.
-	image, err := ref.NewImage(systemContext)
+	image, err := ref.NewImage(context.Background(), systemContext)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
 	defer image.Close()
 
-	imageConfig, err := image.OCIConfig()
+	imageConfig, err := image.OCIConfig(context.Background())
 	if err != nil {
 		return ContainerInfo{}, err
 	}
@@ -410,7 +411,7 @@ func (r *runtimeService) StopContainer(idOrName string) error {
 	if err != nil {
 		return err
 	}
-	err = r.storageImageServer.GetStore().Unmount(container.ID)
+	_, err = r.storageImageServer.GetStore().Unmount(container.ID, false)
 	if err != nil {
 		logrus.Debugf("failed to unmount container %q: %v", container.ID, err)
 		return err

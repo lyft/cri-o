@@ -105,7 +105,7 @@ func addOCIBindMounts(mountLabel string, containerConfig *pb.ContainerConfig, sp
 		options = append(options, "rbind")
 
 		// mount propagation
-		mountInfos, err := dockermounts.GetMounts()
+		mountInfos, err := dockermounts.GetMounts(func (i *dockermounts.Info) (bool, bool) { return false, false })
 		if err != nil {
 			return nil, nil, err
 		}

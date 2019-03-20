@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"net"
 	"path"
@@ -179,7 +180,7 @@ func (svc *imageService) makeRepoDigests(knownRepoDigests, tags []string, imageI
 }
 
 func (svc *imageService) buildImageCacheItem(systemContext *types.SystemContext, ref types.ImageReference, image *storage.Image) (imageCacheItem, error) {
-	img, err := ref.NewImageSource(systemContext)
+	img, err := ref.NewImageSource(context.Background(), systemContext)
 	if err != nil {
 		return imageCacheItem{}, err
 	}
@@ -189,12 +190,12 @@ func (svc *imageService) buildImageCacheItem(systemContext *types.SystemContext,
 	if err != nil {
 		return imageCacheItem{}, err
 	}
-	imageFull, err := ref.NewImage(systemContext)
+	imageFull, err := ref.NewImage(context.Background(), systemContext)
 	if err != nil {
 		return imageCacheItem{}, err
 	}
 	defer imageFull.Close()
-	imageConfig, err := imageFull.OCIConfig()
+	imageConfig, err := imageFull.OCIConfig(context.Background())
 	if err != nil {
 		return imageCacheItem{}, err
 	}
@@ -290,18 +291,18 @@ func (svc *imageService) ImageStatus(systemContext *types.SystemContext, nameOrI
 	if err != nil {
 		return nil, err
 	}
-	imageFull, err := ref.NewImage(systemContext)
+	imageFull, err := ref.NewImage(context.Background(), systemContext)
 	if err != nil {
 		return nil, err
 	}
 	defer imageFull.Close()
 
-	imageConfig, err := imageFull.OCIConfig()
+	imageConfig, err := imageFull.OCIConfig(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
-	img, err := ref.NewImageSource(systemContext)
+	img, err := ref.NewImageSource(context.Background(), systemContext)
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +340,7 @@ func imageSize(img types.ImageSource) *uint64 {
 }
 
 func imageConfigDigest(img types.ImageSource, instanceDigest *digest.Digest) (digest.Digest, error) {
-	manifestBytes, manifestType, err := img.GetManifest(instanceDigest)
+	manifestBytes, manifestType, err := img.GetManifest(context.Background(), instanceDigest)
 	if err != nil {
 		return "", err
 	}
@@ -355,7 +356,7 @@ func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool,
 	if err != nil {
 		return false, err
 	}
-	rawSource, err := srcRef.NewImageSource(options.SourceCtx)
+	rawSource, err := srcRef.NewImageSource(context.Background(), options.SourceCtx)
 	if err != nil {
 		return false, err
 	}
@@ -363,7 +364,7 @@ func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool,
 	if options.SourceCtx != nil {
 		sourceCtx = options.SourceCtx
 	}
-	src, err := image.FromSource(sourceCtx, rawSource)
+	src, err := image.FromSource(context.Background(), sourceCtx, rawSource)
 	if err != nil {
 		rawSource.Close()
 		return false, err
@@ -397,7 +398,7 @@ func (svc *imageService) prepareReference(imageName string, options *copy.Option
 
 	hostname := reference.Domain(srcRef.DockerReference())
 	if secure := svc.isSecureIndex(hostname); !secure {
-		options.SourceCtx.DockerInsecureSkipTLSVerify = !secure
+		options.SourceCtx.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
 	}
 	return srcRef, nil
 }
@@ -411,7 +412,7 @@ func (svc *imageService) PrepareImage(systemContext *types.SystemContext, imageN
 	if err != nil {
 		return nil, err
 	}
-	return srcRef.NewImage(systemContext)
+	return srcRef.NewImage(context.Background(), systemContext)
 }
 
 func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.ImageReference, error) {
@@ -446,7 +447,7 @@ func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName
 	if err != nil {
 		return nil, err
 	}
-	err = copy.Image(policyContext, destRef, srcRef, options)
+	_, err = copy.Image(context.Background(), policyContext, destRef, srcRef, options)
 	if err != nil {
 		return nil, err
 	}
@@ -492,7 +493,7 @@ func (svc *imageService) UntagImage(systemContext *types.SystemContext, nameOrID
 		}
 	}
 
-	return ref.DeleteImage(systemContext)
+	return ref.DeleteImage(context.Background(), systemContext)
 }
 
 func (svc *imageService) RemoveImage(systemContext *types.SystemContext, nameOrID string) error {
@@ -500,7 +501,7 @@ func (svc *imageService) RemoveImage(systemContext *types.SystemContext, nameOrI
 	if err != nil {
 		return err
 	}
-	return ref.DeleteImage(systemContext)
+	return ref.DeleteImage(context.Background(), systemContext)
 }
 
 func (svc *imageService) GetStore() storage.Store {

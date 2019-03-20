@@ -353,7 +353,11 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 		return err
 	}
 
-	processLabel, mountLabel, err := label.InitLabels(label.DupSecOpt(m.Process.SelinuxLabel))
+	dupsec, err := label.DupSecOpt(m.Process.SelinuxLabel)
+	if err != nil {
+		return err
+	}
+	processLabel, mountLabel, err := label.InitLabels(dupsec)
 	if err != nil {
 		return err
 	}

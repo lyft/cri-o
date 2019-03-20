@@ -3,6 +3,7 @@
 package lib
 
 import (
+	"log"
 	"path/filepath"
 	"time"
 
@@ -31,18 +32,25 @@ func (c *ContainerServer) libcontainerStats(ctr *oci.Container) (*libcontainer.S
 }
 
 func (c *ContainerServer) addSandboxPlatform(sb *sandbox.Sandbox) {
-	c.state.processLevels[selinux.NewContext(sb.ProcessLabel())["level"]]++
+	ctx, err := selinux.NewContext(sb.ProcessLabel())
+	if err != nil {
+		log.Fatal(err)
+	}
+	c.state.processLevels[ctx["level"]]++
 }
 
 func (c *ContainerServer) removeSandboxPlatform(sb *sandbox.Sandbox) {
 	processLabel := sb.ProcessLabel()
-	level := selinux.NewContext(processLabel)["level"]
-	pl, ok := c.state.processLevels[level]
+	level, err := selinux.NewContext(processLabel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pl, ok := c.state.processLevels[level["level"]]
 	if ok {
-		c.state.processLevels[level] = pl - 1
-		if c.state.processLevels[level] == 0 {
+		c.state.processLevels[level["level"]] = pl - 1
+		if c.state.processLevels[level["level"]] == 0 {
 			label.ReleaseLabel(processLabel)
-			delete(c.state.processLevels, level)
+			delete(c.state.processLevels, level["level"])
 		}
 	}
 }
