@@ -596,7 +596,7 @@ func (c *copier) createProgressBar(pool *mpb.Progress, info types.BlobInfo, kind
 	// shortDigestLen is the length of the digest used for blobs.
 	const shortDigestLen = 12
 
-	prefix := fmt.Sprintf("Copying %s %s", kind, info.Digest.Encoded())
+	prefix := fmt.Sprintf("Copying %s %v", kind, info.Digest)
 	// Truncate the prefix (chopping of some part of the digest) to make all progress bars aligned in a column.
 	maxPrefixLen := len("Copying blob ") + shortDigestLen
 	if len(prefix) > maxPrefixLen {
