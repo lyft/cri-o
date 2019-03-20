@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"context"
 	"io"
 	"os"
 
@@ -16,15 +17,15 @@ type ociArchiveImageDestination struct {
 }
 
 // newImageDestination returns an ImageDestination for writing to an existing directory.
-func newImageDestination(ctx *types.SystemContext, ref ociArchiveReference) (types.ImageDestination, error) {
+func newImageDestination(ctx context.Context, sys *types.SystemContext, ref ociArchiveReference) (types.ImageDestination, error) {
 	tempDirRef, err := createOCIRef(ref.image)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error creating oci reference")
 	}
-	unpackedDest, err := tempDirRef.ociRefExtracted.NewImageDestination(ctx)
+	unpackedDest, err := tempDirRef.ociRefExtracted.NewImageDestination(ctx, sys)
 	if err != nil {
 		if err := tempDirRef.deleteTempDir(); err != nil {
-			return nil, errors.Wrapf(err, "error deleting temp directory", tempDirRef.tempDirectory)
+			return nil, errors.Wrapf(err, "error deleting temp directory %q", tempDirRef.tempDirectory)
 		}
 		return nil, err
 	}
@@ -50,13 +51,12 @@ func (d *ociArchiveImageDestination) SupportedManifestMIMETypes() []string {
 }
 
 // SupportsSignatures returns an error (to be displayed to the user) if the destination certainly can't store signatures
-func (d *ociArchiveImageDestination) SupportsSignatures() error {
-	return d.unpackedDest.SupportsSignatures()
+func (d *ociArchiveImageDestination) SupportsSignatures(ctx context.Context) error {
+	return d.unpackedDest.SupportsSignatures(ctx)
 }
 
-// ShouldCompressLayers returns true iff it is desirable to compress layer blobs written to this destination
-func (d *ociArchiveImageDestination) ShouldCompressLayers() bool {
-	return d.unpackedDest.ShouldCompressLayers()
+func (d *ociArchiveImageDestination) DesiredLayerCompression() types.LayerCompression {
+	return d.unpackedDest.DesiredLayerCompression()
 }
 
 // AcceptsForeignLayerURLs returns false iff foreign layers in manifest should be actually
@@ -70,35 +70,54 @@ func (d *ociArchiveImageDestination) MustMatchRuntimeOS() bool {
 	return d.unpackedDest.MustMatchRuntimeOS()
 }
 
-// PutBlob writes contents of stream and returns data representing the result (with all data filled in).
+// IgnoresEmbeddedDockerReference returns true iff the destination does not care about Image.EmbeddedDockerReferenceConflicts(),
+// and would prefer to receive an unmodified manifest instead of one modified for the destination.
+// Does not make a difference if Reference().DockerReference() is nil.
+func (d *ociArchiveImageDestination) IgnoresEmbeddedDockerReference() bool {
+	return d.unpackedDest.IgnoresEmbeddedDockerReference()
+}
+
+// HasThreadSafePutBlob indicates whether PutBlob can be executed concurrently.
+func (d *ociArchiveImageDestination) HasThreadSafePutBlob() bool {
+	return false
+}
+
+// PutBlob writes contents of stream and returns data representing the result.
 // inputInfo.Digest can be optionally provided if known; it is not mandatory for the implementation to verify it.
 // inputInfo.Size is the expected length of stream, if known.
-func (d *ociArchiveImageDestination) PutBlob(stream io.Reader, inputInfo types.BlobInfo) (types.BlobInfo, error) {
-	return d.unpackedDest.PutBlob(stream, inputInfo)
+// inputInfo.MediaType describes the blob format, if known.
+// May update cache.
+// WARNING: The contents of stream are being verified on the fly.  Until stream.Read() returns io.EOF, the contents of the data SHOULD NOT be available
+// to any other readers for download using the supplied digest.
+// If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlob MUST 1) fail, and 2) delete any data stored so far.
+func (d *ociArchiveImageDestination) PutBlob(ctx context.Context, stream io.Reader, inputInfo types.BlobInfo, cache types.BlobInfoCache, isConfig bool) (types.BlobInfo, error) {
+	return d.unpackedDest.PutBlob(ctx, stream, inputInfo, cache, isConfig)
 }
 
-// HasBlob returns true iff the image destination already contains a blob with the matching digest which can be reapplied using ReapplyBlob
-func (d *ociArchiveImageDestination) HasBlob(info types.BlobInfo) (bool, int64, error) {
-	return d.unpackedDest.HasBlob(info)
-}
-
-func (d *ociArchiveImageDestination) ReapplyBlob(info types.BlobInfo) (types.BlobInfo, error) {
-	return d.unpackedDest.ReapplyBlob(info)
+// TryReusingBlob checks whether the transport already contains, or can efficiently reuse, a blob, and if so, applies it to the current destination
+// (e.g. if the blob is a filesystem layer, this signifies that the changes it describes need to be applied again when composing a filesystem tree).
+// info.Digest must not be empty.
+// If canSubstitute, TryReusingBlob can use an equivalent equivalent of the desired blob; in that case the returned info may not match the input.
+// If the blob has been succesfully reused, returns (true, info, nil); info must contain at least a digest and size.
+// If the transport can not reuse the requested blob, TryReusingBlob returns (false, {}, nil); it returns a non-nil error only on an unexpected failure.
+// May use and/or update cache.
+func (d *ociArchiveImageDestination) TryReusingBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache, canSubstitute bool) (bool, types.BlobInfo, error) {
+	return d.unpackedDest.TryReusingBlob(ctx, info, cache, canSubstitute)
 }
 
 // PutManifest writes manifest to the destination
-func (d *ociArchiveImageDestination) PutManifest(m []byte) error {
-	return d.unpackedDest.PutManifest(m)
+func (d *ociArchiveImageDestination) PutManifest(ctx context.Context, m []byte) error {
+	return d.unpackedDest.PutManifest(ctx, m)
 }
 
-func (d *ociArchiveImageDestination) PutSignatures(signatures [][]byte) error {
-	return d.unpackedDest.PutSignatures(signatures)
+func (d *ociArchiveImageDestination) PutSignatures(ctx context.Context, signatures [][]byte) error {
+	return d.unpackedDest.PutSignatures(ctx, signatures)
 }
 
 // Commit marks the process of storing the image as successful and asks for the image to be persisted
 // after the directory is made, it is tarred up into a file and the directory is deleted
-func (d *ociArchiveImageDestination) Commit() error {
-	if err := d.unpackedDest.Commit(); err != nil {
+func (d *ociArchiveImageDestination) Commit(ctx context.Context) error {
+	if err := d.unpackedDest.Commit(ctx); err != nil {
 		return errors.Wrapf(err, "error storing image %q", d.ref.image)
 	}
 
@@ -125,6 +144,7 @@ func tarDirectory(src, dst string) error {
 	defer outFile.Close()
 
 	// copies the contents of the directory to the tar file
+	// TODO: This can take quite some time, and should ideally be cancellable using a context.Context.
 	_, err = io.Copy(outFile, input)
 
 	return err

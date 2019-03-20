@@ -4,7 +4,6 @@ package ostree
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -17,7 +16,8 @@ import (
 	"github.com/containers/image/manifest"
 	"github.com/containers/image/types"
 	"github.com/containers/storage/pkg/ioutils"
-	"github.com/opencontainers/go-digest"
+	"github.com/klauspost/pgzip"
+	digest "github.com/opencontainers/go-digest"
 	glib "github.com/ostreedev/ostree-go/pkg/glibobject"
 	"github.com/pkg/errors"
 	"github.com/vbatts/tar-split/tar/asm"
@@ -42,7 +42,7 @@ type ostreeImageSource struct {
 }
 
 // newImageSource returns an ImageSource for reading from an existing directory.
-func newImageSource(ctx *types.SystemContext, tmpDir string, ref ostreeReference) (types.ImageSource, error) {
+func newImageSource(tmpDir string, ref ostreeReference) (types.ImageSource, error) {
 	return &ostreeImageSource{ref: ref, tmpDir: tmpDir, compressed: nil}, nil
 }
 
@@ -92,7 +92,7 @@ func (s *ostreeImageSource) getTarSplitData(blob string) ([]byte, error) {
 
 // GetManifest returns the image's manifest along with its MIME type (which may be empty when it can't be determined but the manifest is available).
 // It may use a remote (= slow) service.
-func (s *ostreeImageSource) GetManifest(instanceDigest *digest.Digest) ([]byte, string, error) {
+func (s *ostreeImageSource) GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error) {
 	if instanceDigest != nil {
 		return nil, "", errors.Errorf(`Manifest lists are not supported by "ostree:"`)
 	}
@@ -255,14 +255,21 @@ func (s *ostreeImageSource) readSingleFile(commit, path string) (io.ReadCloser, 
 	return getter.Get(path)
 }
 
-// GetBlob returns a stream for the specified blob, and the blob's size.
-func (s *ostreeImageSource) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, error) {
+// HasThreadSafeGetBlob indicates whether GetBlob can be executed concurrently.
+func (s *ostreeImageSource) HasThreadSafeGetBlob() bool {
+	return false
+}
+
+// GetBlob returns a stream for the specified blob, and the blob’s size (or -1 if unknown).
+// The Digest field in BlobInfo is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
+// May update BlobInfoCache, preferably after it knows for certain that a blob truly exists at a specific location.
+func (s *ostreeImageSource) GetBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache) (io.ReadCloser, int64, error) {
 
 	blob := info.Digest.Hex()
 
 	// Ensure s.compressed is initialized.  It is build by LayerInfosForCopy.
 	if s.compressed == nil {
-		_, err := s.LayerInfosForCopy()
+		_, err := s.LayerInfosForCopy(ctx)
 		if err != nil {
 			return nil, -1, err
 		}
@@ -302,28 +309,23 @@ func (s *ostreeImageSource) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, 
 	}
 
 	mf := bytes.NewReader(tarsplit)
-	mfz, err := gzip.NewReader(mf)
+	mfz, err := pgzip.NewReader(mf)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer mfz.Close()
 	metaUnpacker := storage.NewJSONUnpacker(mfz)
 
 	getter, err := newOSTreePathFileGetter(s.repo, branch)
 	if err != nil {
+		mfz.Close()
 		return nil, 0, err
 	}
 
 	ots := asm.NewOutputTarStream(getter, metaUnpacker)
 
-	pipeReader, pipeWriter := io.Pipe()
-	go func() {
-		io.Copy(pipeWriter, ots)
-		pipeWriter.Close()
-	}()
-
-	rc := ioutils.NewReadCloserWrapper(pipeReader, func() error {
+	rc := ioutils.NewReadCloserWrapper(ots, func() error {
 		getter.Close()
+		mfz.Close()
 		return ots.Close()
 	})
 	return rc, layerSize, nil
@@ -366,9 +368,9 @@ func (s *ostreeImageSource) GetSignatures(ctx context.Context, instanceDigest *d
 
 // LayerInfosForCopy() returns the list of layer blobs that make up the root filesystem of
 // the image, after they've been decompressed.
-func (s *ostreeImageSource) LayerInfosForCopy() ([]types.BlobInfo, error) {
+func (s *ostreeImageSource) LayerInfosForCopy(ctx context.Context) ([]types.BlobInfo, error) {
 	updatedBlobInfos := []types.BlobInfo{}
-	manifestBlob, manifestType, err := s.GetManifest(nil)
+	manifestBlob, manifestType, err := s.GetManifest(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

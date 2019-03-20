@@ -1,11 +1,13 @@
 package image
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 
 	"github.com/containers/image/docker/reference"
 	"github.com/containers/image/manifest"
+	"github.com/containers/image/pkg/blobinfocache"
 	"github.com/containers/image/types"
 	"github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -54,16 +56,12 @@ func (m *manifestOCI1) ConfigInfo() types.BlobInfo {
 
 // ConfigBlob returns the blob described by ConfigInfo, iff ConfigInfo().Digest != ""; nil otherwise.
 // The result is cached; it is OK to call this however often you need.
-func (m *manifestOCI1) ConfigBlob() ([]byte, error) {
+func (m *manifestOCI1) ConfigBlob(ctx context.Context) ([]byte, error) {
 	if m.configBlob == nil {
 		if m.src == nil {
 			return nil, errors.Errorf("Internal error: neither src nor configBlob set in manifestOCI1")
 		}
-		stream, _, err := m.src.GetBlob(types.BlobInfo{
-			Digest: m.m.Config.Digest,
-			Size:   m.m.Config.Size,
-			URLs:   m.m.Config.URLs,
-		})
+		stream, _, err := m.src.GetBlob(ctx, manifest.BlobInfoFromOCI1Descriptor(m.m.Config), blobinfocache.NoCache)
 		if err != nil {
 			return nil, err
 		}
@@ -84,8 +82,8 @@ func (m *manifestOCI1) ConfigBlob() ([]byte, error) {
 // OCIConfig returns the image configuration as per OCI v1 image-spec. Information about
 // layers in the resulting configuration isn't guaranteed to be returned to due how
 // old image manifests work (docker v2s1 especially).
-func (m *manifestOCI1) OCIConfig() (*imgspecv1.Image, error) {
-	cb, err := m.ConfigBlob()
+func (m *manifestOCI1) OCIConfig(ctx context.Context) (*imgspecv1.Image, error) {
+	cb, err := m.ConfigBlob(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +98,7 @@ func (m *manifestOCI1) OCIConfig() (*imgspecv1.Image, error) {
 // The Digest field is guaranteed to be provided; Size may be -1.
 // WARNING: The list may contain duplicates, and they are semantically relevant.
 func (m *manifestOCI1) LayerInfos() []types.BlobInfo {
-	return m.m.LayerInfos()
+	return manifestLayerInfosToBlobInfos(m.m.LayerInfos())
 }
 
 // EmbeddedDockerReferenceConflicts whether a Docker reference embedded in the manifest, if any, conflicts with destination ref.
@@ -110,13 +108,14 @@ func (m *manifestOCI1) EmbeddedDockerReferenceConflicts(ref reference.Named) boo
 	return false
 }
 
-func (m *manifestOCI1) imageInspectInfo() (*types.ImageInspectInfo, error) {
+// Inspect returns various information for (skopeo inspect) parsed from the manifest and configuration.
+func (m *manifestOCI1) Inspect(ctx context.Context) (*types.ImageInspectInfo, error) {
 	getter := func(info types.BlobInfo) ([]byte, error) {
 		if info.Digest != m.ConfigInfo().Digest {
 			// Shouldn't ever happen
 			return nil, errors.New("asked for a different config blob")
 		}
-		config, err := m.ConfigBlob()
+		config, err := m.ConfigBlob(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +133,7 @@ func (m *manifestOCI1) UpdatedImageNeedsLayerDiffIDs(options types.ManifestUpdat
 
 // UpdatedImage returns a types.Image modified according to options.
 // This does not change the state of the original Image object.
-func (m *manifestOCI1) UpdatedImage(options types.ManifestUpdateOptions) (types.Image, error) {
+func (m *manifestOCI1) UpdatedImage(ctx context.Context, options types.ManifestUpdateOptions) (types.Image, error) {
 	copy := manifestOCI1{ // NOTE: This is not a deep copy, it still shares slices etc.
 		src:        m.src,
 		configBlob: m.configBlob,
@@ -155,7 +154,7 @@ func (m *manifestOCI1) UpdatedImage(options types.ManifestUpdateOptions) (types.
 		if err != nil {
 			return nil, err
 		}
-		return m2.UpdatedImage(types.ManifestUpdateOptions{
+		return m2.UpdatedImage(ctx, types.ManifestUpdateOptions{
 			ManifestMIMEType: options.ManifestMIMEType,
 			InformationOnly:  options.InformationOnly,
 		})

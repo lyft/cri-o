@@ -86,6 +86,14 @@ type Driver struct {
 func InitFilter(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 	logrus.Debugf("WindowsGraphDriver InitFilter at %s", home)
 
+	for _, option := range options {
+		if strings.HasPrefix(option, "windows.mountopt=") {
+			return nil, fmt.Errorf("windows driver does not support mount options")
+		} else {
+			return nil, fmt.Errorf("option %s not supported", option)
+		}
+	}
+
 	fsType, err := getFileSystemType(string(home[0]))
 	if err != nil {
 		return nil, err
@@ -175,6 +183,11 @@ func (d *Driver) Exists(id string) bool {
 		return false
 	}
 	return result
+}
+
+// CreateFromTemplate creates a layer with the same contents and parent as another layer.
+func (d *Driver) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
+	return graphdriver.NaiveCreateFromTemplate(d, id, template, templateIDMappings, parent, parentIDMappings, opts, readWrite)
 }
 
 // CreateReadWrite creates a layer that is writable for use as a container
@@ -354,11 +367,14 @@ func (d *Driver) Remove(id string) error {
 }
 
 // Get returns the rootfs path for the id. This will mount the dir at its given path.
-func (d *Driver) Get(id, mountLabel string) (string, error) {
+func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	panicIfUsedByLcow()
-	logrus.Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, mountLabel)
+	logrus.Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, options.MountLabel)
 	var dir string
 
+	if len(options.Options) > 0 {
+		return "", fmt.Errorf("windows driver does not support mount options")
+	}
 	rID, err := d.resolveID(id)
 	if err != nil {
 		return "", err
@@ -472,7 +488,7 @@ func (d *Driver) Cleanup() error {
 // Diff produces an archive of the changes between the specified
 // layer and its parent layer which may be "".
 // The layer should be mounted when calling this function
-func (d *Driver) Diff(id, parent, mountLabel string) (_ io.ReadCloser, err error) {
+func (d *Driver) Diff(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (_ io.ReadCloser, err error) {
 	panicIfUsedByLcow()
 	rID, err := d.resolveID(id)
 	if err != nil {
@@ -509,7 +525,7 @@ func (d *Driver) Diff(id, parent, mountLabel string) (_ io.ReadCloser, err error
 // Changes produces a list of changes between the specified layer
 // and its parent layer. If parent is "", then all changes will be ADD changes.
 // The layer should not be mounted when calling this function.
-func (d *Driver) Changes(id, parent, mountLabel string) ([]archive.Change, error) {
+func (d *Driver) Changes(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) ([]archive.Change, error) {
 	panicIfUsedByLcow()
 	rID, err := d.resolveID(id)
 	if err != nil {
@@ -565,7 +581,7 @@ func (d *Driver) Changes(id, parent, mountLabel string) ([]archive.Change, error
 // layer with the specified id and parent, returning the size of the
 // new layer in bytes.
 // The layer should not be mounted when calling this function
-func (d *Driver) ApplyDiff(id, parent, mountLabel string, diff io.Reader) (int64, error) {
+func (d *Driver) ApplyDiff(id string, idMappings *idtools.IDMappings, parent, mountLabel string, diff io.Reader) (int64, error) {
 	panicIfUsedByLcow()
 	var layerChain []string
 	if parent != "" {
@@ -600,19 +616,19 @@ func (d *Driver) ApplyDiff(id, parent, mountLabel string, diff io.Reader) (int64
 // DiffSize calculates the changes between the specified layer
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
-func (d *Driver) DiffSize(id, parent, mountLabel string) (size int64, err error) {
+func (d *Driver) DiffSize(id string, idMappings *idtools.IDMappings, parent string, parentMappings *idtools.IDMappings, mountLabel string) (size int64, err error) {
 	panicIfUsedByLcow()
 	rPId, err := d.resolveID(parent)
 	if err != nil {
 		return
 	}
 
-	changes, err := d.Changes(id, rPId, mountLabel)
+	changes, err := d.Changes(id, idMappings, rPId, parentMappings, mountLabel)
 	if err != nil {
 		return
 	}
 
-	layerFs, err := d.Get(id, "")
+	layerFs, err := d.Get(id, graphdriver.MountOpts{})
 	if err != nil {
 		return
 	}
@@ -938,6 +954,17 @@ func (d *Driver) DiffGetter(id string) (graphdriver.FileGetCloser, error) {
 // AdditionalImageStores returns additional image stores supported by the driver
 func (d *Driver) AdditionalImageStores() []string {
 	return nil
+}
+
+// UpdateLayerIDMap changes ownerships in the layer's filesystem tree from
+// matching those in toContainer to matching those in toHost.
+func (d *Driver) UpdateLayerIDMap(id string, toContainer, toHost *idtools.IDMappings, mountLabel string) error {
+	return fmt.Errorf("windows doesn't support changing ID mappings")
+}
+
+// SupportsShifting tells whether the driver support shifting of the UIDs/GIDs in an userNS
+func (d *Driver) SupportsShifting() bool {
+	return false
 }
 
 type storageOptions struct {

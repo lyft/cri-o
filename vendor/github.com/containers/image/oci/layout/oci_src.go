@@ -24,15 +24,15 @@ type ociImageSource struct {
 }
 
 // newImageSource returns an ImageSource for reading from an existing directory.
-func newImageSource(ctx *types.SystemContext, ref ociReference) (types.ImageSource, error) {
+func newImageSource(sys *types.SystemContext, ref ociReference) (types.ImageSource, error) {
 	tr := tlsclientconfig.NewTransport()
 	tr.TLSClientConfig = tlsconfig.ServerDefault()
 
-	if ctx != nil && ctx.OCICertPath != "" {
-		if err := tlsclientconfig.SetupCertificates(ctx.OCICertPath, tr.TLSClientConfig); err != nil {
+	if sys != nil && sys.OCICertPath != "" {
+		if err := tlsclientconfig.SetupCertificates(sys.OCICertPath, tr.TLSClientConfig); err != nil {
 			return nil, err
 		}
-		tr.TLSClientConfig.InsecureSkipVerify = ctx.OCIInsecureSkipTLSVerify
+		tr.TLSClientConfig.InsecureSkipVerify = sys.OCIInsecureSkipTLSVerify
 	}
 
 	client := &http.Client{}
@@ -42,9 +42,9 @@ func newImageSource(ctx *types.SystemContext, ref ociReference) (types.ImageSour
 		return nil, err
 	}
 	d := &ociImageSource{ref: ref, descriptor: descriptor, client: client}
-	if ctx != nil {
+	if sys != nil {
 		// TODO(jonboulle): check dir existence?
-		d.sharedBlobDir = ctx.OCISharedBlobDirPath
+		d.sharedBlobDir = sys.OCISharedBlobDirPath
 	}
 	return d, nil
 }
@@ -63,7 +63,7 @@ func (s *ociImageSource) Close() error {
 // It may use a remote (= slow) service.
 // If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve (when the primary manifest is a manifest list);
 // this never happens if the primary manifest is not a manifest list (e.g. if the source never returns manifest lists).
-func (s *ociImageSource) GetManifest(instanceDigest *digest.Digest) ([]byte, string, error) {
+func (s *ociImageSource) GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error) {
 	var dig digest.Digest
 	var mimeType string
 	if instanceDigest == nil {
@@ -92,10 +92,17 @@ func (s *ociImageSource) GetManifest(instanceDigest *digest.Digest) ([]byte, str
 	return m, mimeType, nil
 }
 
-// GetBlob returns a stream for the specified blob, and the blob's size.
-func (s *ociImageSource) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, error) {
+// HasThreadSafeGetBlob indicates whether GetBlob can be executed concurrently.
+func (s *ociImageSource) HasThreadSafeGetBlob() bool {
+	return false
+}
+
+// GetBlob returns a stream for the specified blob, and the blob’s size (or -1 if unknown).
+// The Digest field in BlobInfo is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
+// May update BlobInfoCache, preferably after it knows for certain that a blob truly exists at a specific location.
+func (s *ociImageSource) GetBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache) (io.ReadCloser, int64, error) {
 	if len(info.URLs) != 0 {
-		return s.getExternalBlob(info.URLs)
+		return s.getExternalBlob(ctx, info.URLs)
 	}
 
 	path, err := s.ref.blobPath(info.Digest, s.sharedBlobDir)
@@ -122,10 +129,17 @@ func (s *ociImageSource) GetSignatures(ctx context.Context, instanceDigest *dige
 	return [][]byte{}, nil
 }
 
-func (s *ociImageSource) getExternalBlob(urls []string) (io.ReadCloser, int64, error) {
+func (s *ociImageSource) getExternalBlob(ctx context.Context, urls []string) (io.ReadCloser, int64, error) {
 	errWrap := errors.New("failed fetching external blob from all urls")
 	for _, url := range urls {
-		resp, err := s.client.Get(url)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			errWrap = errors.Wrapf(errWrap, "fetching %s failed %s", url, err.Error())
+			continue
+		}
+
+		resp, err := s.client.Do(req.WithContext(ctx))
 		if err != nil {
 			errWrap = errors.Wrapf(errWrap, "fetching %s failed %s", url, err.Error())
 			continue
@@ -144,7 +158,7 @@ func (s *ociImageSource) getExternalBlob(urls []string) (io.ReadCloser, int64, e
 }
 
 // LayerInfosForCopy() returns updated layer info that should be used when reading, in preference to values in the manifest, if specified.
-func (s *ociImageSource) LayerInfosForCopy() ([]types.BlobInfo, error) {
+func (s *ociImageSource) LayerInfosForCopy(ctx context.Context) ([]types.BlobInfo, error) {
 	return nil, nil
 }
 

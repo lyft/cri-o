@@ -78,16 +78,16 @@ type ImageReference interface {
 	// NOTE: If any kind of signature verification should happen, build an UnparsedImage from the value returned by NewImageSource,
 	// verify that UnparsedImage, and convert it into a real Image via image.FromUnparsedImage.
 	// WARNING: This may not do the right thing for a manifest list, see image.FromSource for details.
-	NewImage(ctx *SystemContext) (ImageCloser, error)
+	NewImage(ctx context.Context, sys *SystemContext) (ImageCloser, error)
 	// NewImageSource returns a types.ImageSource for this reference.
 	// The caller must call .Close() on the returned ImageSource.
-	NewImageSource(ctx *SystemContext) (ImageSource, error)
+	NewImageSource(ctx context.Context, sys *SystemContext) (ImageSource, error)
 	// NewImageDestination returns a types.ImageDestination for this reference.
 	// The caller must call .Close() on the returned ImageDestination.
-	NewImageDestination(ctx *SystemContext) (ImageDestination, error)
+	NewImageDestination(ctx context.Context, sys *SystemContext) (ImageDestination, error)
 
 	// DeleteImage deletes the named image from the registry, if supported.
-	DeleteImage(ctx *SystemContext) error
+	DeleteImage(ctx context.Context, sys *SystemContext) error
 }
 
 // BlobInfo collects known information about a blob (layer/config).
@@ -98,6 +98,82 @@ type BlobInfo struct {
 	URLs        []string
 	Annotations map[string]string
 	MediaType   string
+}
+
+// BICTransportScope encapsulates transport-dependent representation of a “scope” where blobs are or are not present.
+// BlobInfocache.RecordKnownLocations / BlobInfocache.CandidateLocations record data aboud blobs keyed by (scope, digest).
+// The scope will typically be similar to an ImageReference, or a superset of it within which blobs are reusable.
+//
+// NOTE: The contents of this structure may be recorded in a persistent file, possibly shared across different
+// tools which use different versions of the transport.  Allow for reasonable backward/forward compatibility,
+// at least by not failing hard when encountering unknown data.
+type BICTransportScope struct {
+	Opaque string
+}
+
+// BICLocationReference encapsulates transport-dependent representation of a blob location within a BICTransportScope.
+// Each transport can store arbitrary data using BlobInfoCache.RecordKnownLocation, and ImageDestination.TryReusingBlob
+// can look it up using BlobInfoCache.CandidateLocations.
+//
+// NOTE: The contents of this structure may be recorded in a persistent file, possibly shared across different
+// tools which use different versions of the transport.  Allow for reasonable backward/forward compatibility,
+// at least by not failing hard when encountering unknown data.
+type BICLocationReference struct {
+	Opaque string
+}
+
+// BICReplacementCandidate is an item returned by BlobInfoCache.CandidateLocations.
+type BICReplacementCandidate struct {
+	Digest   digest.Digest
+	Location BICLocationReference
+}
+
+// BlobInfoCache records data useful for reusing blobs, or substituing equivalent ones, to avoid unnecessary blob copies.
+//
+// It records two kinds of data:
+// - Sets of corresponding digest vs. uncompressed digest ("DiffID") pairs:
+//   One of the two digests is known to be uncompressed, and a single uncompressed digest may correspond to more than one compressed digest.
+//   This allows matching compressed layer blobs to existing local uncompressed layers (to avoid unnecessary download and decompresssion),
+//   or uncompressed layer blobs to existing remote compressed layers (to avoid unnecessary compression and upload)/
+//
+//   It is allowed to record an (uncompressed digest, the same uncompressed digest) correspondence, to express that the digest is known
+//   to be uncompressed (i.e. that a conversion from schema1 does not have to decompress the blob to compute a DiffID value).
+//
+//   This mapping is primarily maintained in generic copy.Image code, but transports may want to contribute more data points if they independently
+//   compress/decompress blobs for their own purposes.
+//
+// - Known blob locations, managed by individual transports:
+//   The transports call RecordKnownLocation when encountering a blob that could possibly be reused (typically in GetBlob/PutBlob/TryReusingBlob),
+//   recording transport-specific information that allows the transport to reuse the blob in the future;
+//   then, TryReusingBlob implementations can call CandidateLocations to look up previously recorded blob locations that could be reused.
+//
+//   Each transport defines its own “scopes” within which blob reuse is possible (e.g. in, the docker/distribution case, blobs
+//   can be directly reused within a registry, or mounted across registries within a registry server.)
+//
+// None of the methods return an error indication: errors when neither reading from, nor writing to, the cache, should be fatal;
+// users of the cahce should just fall back to copying the blobs the usual way.
+type BlobInfoCache interface {
+	// UncompressedDigest returns an uncompressed digest corresponding to anyDigest.
+	// May return anyDigest if it is known to be uncompressed.
+	// Returns "" if nothing is known about the digest (it may be compressed or uncompressed).
+	UncompressedDigest(anyDigest digest.Digest) digest.Digest
+	// RecordDigestUncompressedPair records that the uncompressed version of anyDigest is uncompressed.
+	// It’s allowed for anyDigest == uncompressed.
+	// WARNING: Only call this for LOCALLY VERIFIED data; don’t record a digest pair just because some remote author claims so (e.g.
+	// because a manifest/config pair exists); otherwise the cache could be poisoned and allow substituting unexpected blobs.
+	// (Eventually, the DiffIDs in image config could detect the substitution, but that may be too late, and not all image formats contain that data.)
+	RecordDigestUncompressedPair(anyDigest digest.Digest, uncompressed digest.Digest)
+
+	// RecordKnownLocation records that a blob with the specified digest exists within the specified (transport, scope) scope,
+	// and can be reused given the opaque location data.
+	RecordKnownLocation(transport ImageTransport, scope BICTransportScope, digest digest.Digest, location BICLocationReference)
+	// CandidateLocations returns a prioritized, limited, number of blobs and their locations that could possibly be reused
+	// within the specified (transport scope) (if they still exist, which is not guaranteed).
+	//
+	// If !canSubstitute, the returned cadidates will match the submitted digest exactly; if canSubstitute,
+	// data from previous RecordDigestUncompressedPair calls is used to also look up variants of the blob which have the same
+	// uncompressed digest.
+	CandidateLocations(transport ImageTransport, scope BICTransportScope, digest digest.Digest, canSubstitute bool) []BICReplacementCandidate
 }
 
 // ImageSource is a service, possibly remote (= slow), to download components of a single image or a named image set (manifest list).
@@ -117,10 +193,13 @@ type ImageSource interface {
 	// It may use a remote (= slow) service.
 	// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve (when the primary manifest is a manifest list);
 	// this never happens if the primary manifest is not a manifest list (e.g. if the source never returns manifest lists).
-	GetManifest(instanceDigest *digest.Digest) ([]byte, string, error)
+	GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error)
 	// GetBlob returns a stream for the specified blob, and the blob’s size (or -1 if unknown).
 	// The Digest field in BlobInfo is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
-	GetBlob(BlobInfo) (io.ReadCloser, int64, error)
+	// May update BlobInfoCache, preferably after it knows for certain that a blob truly exists at a specific location.
+	GetBlob(context.Context, BlobInfo, BlobInfoCache) (io.ReadCloser, int64, error)
+	// HasThreadSafeGetBlob indicates whether GetBlob can be executed concurrently.
+	HasThreadSafeGetBlob() bool
 	// GetSignatures returns the image's signatures.  It may use a remote (= slow) service.
 	// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve signatures for
 	// (when the primary manifest is a manifest list); this never happens if the primary manifest is not a manifest list
@@ -129,14 +208,26 @@ type ImageSource interface {
 	// LayerInfosForCopy returns either nil (meaning the values in the manifest are fine), or updated values for the layer blobsums that are listed in the image's manifest.
 	// The Digest field is guaranteed to be provided; Size may be -1.
 	// WARNING: The list may contain duplicates, and they are semantically relevant.
-	LayerInfosForCopy() ([]BlobInfo, error)
+	LayerInfosForCopy(ctx context.Context) ([]BlobInfo, error)
 }
+
+// LayerCompression indicates if layers must be compressed, decompressed or preserved
+type LayerCompression int
+
+const (
+	// PreserveOriginal indicates the layer must be preserved, ie
+	// no compression or decompression.
+	PreserveOriginal LayerCompression = iota
+	// Decompress indicates the layer must be decompressed
+	Decompress
+	// Compress indicates the layer must be compressed
+	Compress
+)
 
 // ImageDestination is a service, possibly remote (= slow), to store components of a single image.
 //
 // There is a specific required order for some of the calls:
-// PutBlob on the various blobs, if any, MUST be called before PutManifest (manifest references blobs, which may be created or compressed only at push time)
-// ReapplyBlob, if used, MUST only be called if HasBlob returned true for the same blob digest
+// TryReusingBlob/PutBlob on the various blobs, if any, MUST be called before PutManifest (manifest references blobs, which may be created or compressed only at push time)
 // PutSignatures, if called, MUST be called after PutManifest (signatures reference manifest contents)
 // Finally, Commit MUST be called if the caller wants the image, as formed by the components saved above, to persist.
 //
@@ -153,40 +244,49 @@ type ImageDestination interface {
 	SupportedManifestMIMETypes() []string
 	// SupportsSignatures returns an error (to be displayed to the user) if the destination certainly can't store signatures.
 	// Note: It is still possible for PutSignatures to fail if SupportsSignatures returns nil.
-	SupportsSignatures() error
-	// ShouldCompressLayers returns true iff it is desirable to compress layer blobs written to this destination.
-	ShouldCompressLayers() bool
+	SupportsSignatures(ctx context.Context) error
+	// DesiredLayerCompression indicates the kind of compression to apply on layers
+	DesiredLayerCompression() LayerCompression
 	// AcceptsForeignLayerURLs returns false iff foreign layers in manifest should be actually
 	// uploaded to the image destination, true otherwise.
 	AcceptsForeignLayerURLs() bool
 	// MustMatchRuntimeOS returns true iff the destination can store only images targeted for the current runtime OS. False otherwise.
 	MustMatchRuntimeOS() bool
+	// IgnoresEmbeddedDockerReference() returns true iff the destination does not care about Image.EmbeddedDockerReferenceConflicts(),
+	// and would prefer to receive an unmodified manifest instead of one modified for the destination.
+	// Does not make a difference if Reference().DockerReference() is nil.
+	IgnoresEmbeddedDockerReference() bool
+
 	// PutBlob writes contents of stream and returns data representing the result.
 	// inputInfo.Digest can be optionally provided if known; it is not mandatory for the implementation to verify it.
 	// inputInfo.Size is the expected length of stream, if known.
 	// inputInfo.MediaType describes the blob format, if known.
+	// May update cache.
 	// WARNING: The contents of stream are being verified on the fly.  Until stream.Read() returns io.EOF, the contents of the data SHOULD NOT be available
 	// to any other readers for download using the supplied digest.
 	// If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlob MUST 1) fail, and 2) delete any data stored so far.
-	PutBlob(stream io.Reader, inputInfo BlobInfo) (BlobInfo, error)
-	// HasBlob returns true iff the image destination already contains a blob with the matching digest which can be reapplied using ReapplyBlob.
-	// Unlike PutBlob, the digest can not be empty.  If HasBlob returns true, the size of the blob must also be returned.
-	// If the destination does not contain the blob, or it is unknown, HasBlob ordinarily returns (false, -1, nil);
-	// it returns a non-nil error only on an unexpected failure.
-	HasBlob(info BlobInfo) (bool, int64, error)
-	// ReapplyBlob informs the image destination that a blob for which HasBlob previously returned true would have been passed to PutBlob if it had returned false.  Like HasBlob and unlike PutBlob, the digest can not be empty.  If the blob is a filesystem layer, this signifies that the changes it describes need to be applied again when composing a filesystem tree.
-	ReapplyBlob(info BlobInfo) (BlobInfo, error)
+	PutBlob(ctx context.Context, stream io.Reader, inputInfo BlobInfo, cache BlobInfoCache, isConfig bool) (BlobInfo, error)
+	// HasThreadSafePutBlob indicates whether PutBlob can be executed concurrently.
+	HasThreadSafePutBlob() bool
+	// TryReusingBlob checks whether the transport already contains, or can efficiently reuse, a blob, and if so, applies it to the current destination
+	// (e.g. if the blob is a filesystem layer, this signifies that the changes it describes need to be applied again when composing a filesystem tree).
+	// info.Digest must not be empty.
+	// If canSubstitute, TryReusingBlob can use an equivalent equivalent of the desired blob; in that case the returned info may not match the input.
+	// If the blob has been succesfully reused, returns (true, info, nil); info must contain at least a digest and size.
+	// If the transport can not reuse the requested blob, TryReusingBlob returns (false, {}, nil); it returns a non-nil error only on an unexpected failure.
+	// May use and/or update cache.
+	TryReusingBlob(ctx context.Context, info BlobInfo, cache BlobInfoCache, canSubstitute bool) (bool, BlobInfo, error)
 	// PutManifest writes manifest to the destination.
 	// FIXME? This should also receive a MIME type if known, to differentiate between schema versions.
 	// If the destination is in principle available, refuses this manifest type (e.g. it does not recognize the schema),
 	// but may accept a different manifest type, the returned error must be an ManifestTypeRejectedError.
-	PutManifest(manifest []byte) error
-	PutSignatures(signatures [][]byte) error
+	PutManifest(ctx context.Context, manifest []byte) error
+	PutSignatures(ctx context.Context, signatures [][]byte) error
 	// Commit marks the process of storing the image as successful and asks for the image to be persisted.
 	// WARNING: This does not have any transactional semantics:
 	// - Uploaded data MAY be visible to others before Commit() is called
 	// - Uploaded data MAY be removed or MAY remain around if Close() is called without Commit() (i.e. rollback is allowed but not guaranteed)
-	Commit() error
+	Commit(ctx context.Context) error
 }
 
 // ManifestTypeRejectedError is returned by ImageDestination.PutManifest if the destination is in principle available,
@@ -212,13 +312,9 @@ type UnparsedImage interface {
 	// (not as the image itself, or its underlying storage, claims).  This can be used e.g. to determine which public keys are trusted for this image.
 	Reference() ImageReference
 	// Manifest is like ImageSource.GetManifest, but the result is cached; it is OK to call this however often you need.
-	Manifest() ([]byte, string, error)
+	Manifest(ctx context.Context) ([]byte, string, error)
 	// Signatures is like ImageSource.GetSignatures, but the result is cached; it is OK to call this however often you need.
 	Signatures(ctx context.Context) ([][]byte, error)
-	// LayerInfosForCopy returns either nil (meaning the values in the manifest are fine), or updated values for the layer blobsums that are listed in the image's manifest.
-	// The Digest field is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
-	// WARNING: The list may contain duplicates, and they are semantically relevant.
-	LayerInfosForCopy() ([]BlobInfo, error)
 }
 
 // Image is the primary API for inspecting properties of images.
@@ -233,21 +329,25 @@ type Image interface {
 	ConfigInfo() BlobInfo
 	// ConfigBlob returns the blob described by ConfigInfo, if ConfigInfo().Digest != ""; nil otherwise.
 	// The result is cached; it is OK to call this however often you need.
-	ConfigBlob() ([]byte, error)
+	ConfigBlob(context.Context) ([]byte, error)
 	// OCIConfig returns the image configuration as per OCI v1 image-spec. Information about
 	// layers in the resulting configuration isn't guaranteed to be returned to due how
 	// old image manifests work (docker v2s1 especially).
-	OCIConfig() (*v1.Image, error)
+	OCIConfig(context.Context) (*v1.Image, error)
 	// LayerInfos returns a list of BlobInfos of layers referenced by this image, in order (the root layer first, and then successive layered layers).
 	// The Digest field is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
 	// WARNING: The list may contain duplicates, and they are semantically relevant.
 	LayerInfos() []BlobInfo
+	// LayerInfosForCopy returns either nil (meaning the values in the manifest are fine), or updated values for the layer blobsums that are listed in the image's manifest.
+	// The Digest field is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
+	// WARNING: The list may contain duplicates, and they are semantically relevant.
+	LayerInfosForCopy(context.Context) ([]BlobInfo, error)
 	// EmbeddedDockerReferenceConflicts whether a Docker reference embedded in the manifest, if any, conflicts with destination ref.
 	// It returns false if the manifest does not embed a Docker reference.
 	// (This embedding unfortunately happens for Docker schema1, please do not add support for this in any new formats.)
 	EmbeddedDockerReferenceConflicts(ref reference.Named) bool
 	// Inspect returns various information for (skopeo inspect) parsed from the manifest and configuration.
-	Inspect() (*ImageInspectInfo, error)
+	Inspect(context.Context) (*ImageInspectInfo, error)
 	// UpdatedImageNeedsLayerDiffIDs returns true iff UpdatedImage(options) needs InformationOnly.LayerDiffIDs.
 	// This is a horribly specific interface, but computing InformationOnly.LayerDiffIDs can be very expensive to compute
 	// (most importantly it forces us to download the full layers even if they are already present at the destination).
@@ -255,7 +355,7 @@ type Image interface {
 	// UpdatedImage returns a types.Image modified according to options.
 	// Everything in options.InformationOnly should be provided, other fields should be set only if a modification is desired.
 	// This does not change the state of the original Image object.
-	UpdatedImage(options ManifestUpdateOptions) (Image, error)
+	UpdatedImage(ctx context.Context, options ManifestUpdateOptions) (Image, error)
 	// Size returns an approximation of the amount of disk space which is consumed by the image in its current
 	// location.  If the size is not known, -1 will be returned.
 	Size() (int64, error)
@@ -292,7 +392,7 @@ type ManifestUpdateInformation struct {
 // for other manifest types.
 type ImageInspectInfo struct {
 	Tag           string
-	Created       time.Time
+	Created       *time.Time
 	DockerVersion string
 	Labels        map[string]string
 	Architecture  string
@@ -304,6 +404,30 @@ type ImageInspectInfo struct {
 type DockerAuthConfig struct {
 	Username string
 	Password string
+}
+
+// OptionalBool is a boolean with an additional undefined value, which is meant
+// to be used in the context of user input to distinguish between a
+// user-specified value and a default value.
+type OptionalBool byte
+
+const (
+	// OptionalBoolUndefined indicates that the OptionalBoolean hasn't been written.
+	OptionalBoolUndefined OptionalBool = iota
+	// OptionalBoolTrue represents the boolean true.
+	OptionalBoolTrue
+	// OptionalBoolFalse represents the boolean false.
+	OptionalBoolFalse
+)
+
+// NewOptionalBool converts the input bool into either OptionalBoolTrue or
+// OptionalBoolFalse.  The function is meant to avoid boilerplate code of users.
+func NewOptionalBool(b bool) OptionalBool {
+	o := OptionalBoolFalse
+	if b == true {
+		o = OptionalBoolTrue
+	}
+	return o
 }
 
 // SystemContext allows parameterizing access to implicitly-accessed resources,
@@ -333,6 +457,11 @@ type SystemContext struct {
 	ArchitectureChoice string
 	// If not "", overrides the use of platform.GOOS when choosing an image or verifying OS match.
 	OSChoice string
+	// If not "", overrides the system's default directory containing a blob info cache.
+	BlobInfoCacheDir string
+
+	// Additional tags when creating or copying a docker-archive.
+	DockerArchiveAdditionalTags []reference.NamedTagged
 
 	// === OCI.Transport overrides ===
 	// If not "", a directory containing a CA certificate (ending with ".crt"),
@@ -343,6 +472,8 @@ type SystemContext struct {
 	OCIInsecureSkipTLSVerify bool
 	// If not "", use a shared directory for storing blobs rather than within OCI layouts
 	OCISharedBlobDirPath string
+	// Allow UnCompress image layer for OCI image layer
+	OCIAcceptUncompressedLayers bool
 
 	// === docker.Transport overrides ===
 	// If not "", a directory containing a CA certificate (ending with ".crt"),
@@ -353,7 +484,7 @@ type SystemContext struct {
 	// Ignored if DockerCertPath is non-empty.
 	DockerPerHostCertDirPath string
 	// Allow contacting docker registries over HTTP, or HTTPS with failed TLS verification. Note that this does not affect other TLS connections.
-	DockerInsecureSkipTLSVerify bool
+	DockerInsecureSkipTLSVerify OptionalBool
 	// if nil, the library tries to parse ~/.docker/config.json to retrieve credentials
 	DockerAuthConfig *DockerAuthConfig
 	// if not "", an User-Agent header is added to each request when contacting a registry.

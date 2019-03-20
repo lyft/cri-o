@@ -90,7 +90,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		}
 	}
 
-	return graphdriver.NewNaiveDiffDriver(driver, uidMaps, gidMaps), nil
+	return graphdriver.NewNaiveDiffDriver(driver, graphdriver.NewNaiveLayerIDMapUpdater(driver)), nil
 }
 
 func parseOptions(opt []string) (btrfsOptions, bool, error) {
@@ -110,6 +110,8 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 			}
 			userDiskQuota = true
 			options.minSpace = uint64(minSpace)
+		case "btrfs.mountopt":
+			return options, userDiskQuota, fmt.Errorf("btrfs driver does not support mount options")
 		default:
 			return options, userDiskQuota, fmt.Errorf("Unknown option %s", key)
 		}
@@ -488,6 +490,11 @@ func (d *Driver) quotasDirID(id string) string {
 	return path.Join(d.quotasDir(), id)
 }
 
+// CreateFromTemplate creates a layer with the same contents and parent as another layer.
+func (d *Driver) CreateFromTemplate(id, template string, templateIDMappings *idtools.IDMappings, parent string, parentIDMappings *idtools.IDMappings, opts *graphdriver.CreateOpts, readWrite bool) error {
+	return d.Create(id, template, opts)
+}
+
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
@@ -632,11 +639,14 @@ func (d *Driver) Remove(id string) error {
 }
 
 // Get the requested filesystem id.
-func (d *Driver) Get(id, mountLabel string) (string, error) {
+func (d *Driver) Get(id string, options graphdriver.MountOpts) (string, error) {
 	dir := d.subvolumesDirID(id)
 	st, err := os.Stat(dir)
 	if err != nil {
 		return "", err
+	}
+	if len(options.Options) > 0 {
+		return "", fmt.Errorf("btrfs driver does not support mount options")
 	}
 
 	if !st.IsDir() {

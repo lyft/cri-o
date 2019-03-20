@@ -2,7 +2,6 @@ package tarball
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,7 +13,7 @@ import (
 	"time"
 
 	"github.com/containers/image/types"
-
+	"github.com/klauspost/pgzip"
 	digest "github.com/opencontainers/go-digest"
 	imgspecs "github.com/opencontainers/image-spec/specs-go"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -34,7 +33,7 @@ type tarballImageSource struct {
 	manifest   []byte
 }
 
-func (r *tarballReference) NewImageSource(ctx *types.SystemContext) (types.ImageSource, error) {
+func (r *tarballReference) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
 	// Gather up the digests, sizes, and date information for all of the files.
 	filenames := []string{}
 	diffIDs := []digest.Digest{}
@@ -77,7 +76,7 @@ func (r *tarballReference) NewImageSource(ctx *types.SystemContext) (types.Image
 
 		// Set up to digest the file after we maybe decompress it.
 		diffIDdigester := digest.Canonical.Digester()
-		uncompressed, err := gzip.NewReader(reader)
+		uncompressed, err := pgzip.NewReader(reader)
 		if err == nil {
 			// It is compressed, so the diffID is the digest of the uncompressed version
 			reader = io.TeeReader(uncompressed, diffIDdigester.Hash())
@@ -87,6 +86,7 @@ func (r *tarballReference) NewImageSource(ctx *types.SystemContext) (types.Image
 			layerType = imgspecv1.MediaTypeImageLayer
 			uncompressed = nil
 		}
+		// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
 		n, err := io.Copy(ioutil.Discard, reader)
 		if err != nil {
 			return nil, fmt.Errorf("error reading %q: %v", filename, err)
@@ -206,7 +206,15 @@ func (is *tarballImageSource) Close() error {
 	return nil
 }
 
-func (is *tarballImageSource) GetBlob(blobinfo types.BlobInfo) (io.ReadCloser, int64, error) {
+// HasThreadSafeGetBlob indicates whether GetBlob can be executed concurrently.
+func (is *tarballImageSource) HasThreadSafeGetBlob() bool {
+	return false
+}
+
+// GetBlob returns a stream for the specified blob, and the blob’s size (or -1 if unknown).
+// The Digest field in BlobInfo is guaranteed to be provided, Size may be -1 and MediaType may be optionally provided.
+// May update BlobInfoCache, preferably after it knows for certain that a blob truly exists at a specific location.
+func (is *tarballImageSource) GetBlob(ctx context.Context, blobinfo types.BlobInfo, cache types.BlobInfoCache) (io.ReadCloser, int64, error) {
 	// We should only be asked about things in the manifest.  Maybe the configuration blob.
 	if blobinfo.Digest == is.configID {
 		return ioutil.NopCloser(bytes.NewBuffer(is.config)), is.configSize, nil
@@ -232,7 +240,7 @@ func (is *tarballImageSource) GetBlob(blobinfo types.BlobInfo) (io.ReadCloser, i
 // It may use a remote (= slow) service.
 // If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve (when the primary manifest is a manifest list);
 // this never happens if the primary manifest is not a manifest list (e.g. if the source never returns manifest lists).
-func (is *tarballImageSource) GetManifest(instanceDigest *digest.Digest) ([]byte, string, error) {
+func (is *tarballImageSource) GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error) {
 	if instanceDigest != nil {
 		return nil, "", fmt.Errorf("manifest lists are not supported by the %q transport", transportName)
 	}
@@ -255,6 +263,6 @@ func (is *tarballImageSource) Reference() types.ImageReference {
 }
 
 // LayerInfosForCopy() returns updated layer info that should be used when reading, in preference to values in the manifest, if specified.
-func (*tarballImageSource) LayerInfosForCopy() ([]types.BlobInfo, error) {
+func (*tarballImageSource) LayerInfosForCopy(ctx context.Context) ([]types.BlobInfo, error) {
 	return nil, nil
 }
