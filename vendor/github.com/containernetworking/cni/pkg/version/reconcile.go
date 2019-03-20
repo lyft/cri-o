@@ -17,12 +17,12 @@ package version
 import "fmt"
 
 type ErrorIncompatible struct {
-	Config    string
-	Supported []string
+	Config string
+	Plugin []string
 }
 
 func (e *ErrorIncompatible) Details() string {
-	return fmt.Sprintf("config is %q, plugin supports %q", e.Config, e.Supported)
+	return fmt.Sprintf("config is %q, plugin supports %q", e.Config, e.Plugin)
 }
 
 func (e *ErrorIncompatible) Error() string {
@@ -31,19 +31,17 @@ func (e *ErrorIncompatible) Error() string {
 
 type Reconciler struct{}
 
-func (r *Reconciler) Check(configVersion string, pluginInfo PluginInfo) *ErrorIncompatible {
-	return r.CheckRaw(configVersion, pluginInfo.SupportedVersions())
-}
+func (*Reconciler) Check(configVersion string, pluginInfo PluginInfo) *ErrorIncompatible {
+	pluginVersions := pluginInfo.SupportedVersions()
 
-func (*Reconciler) CheckRaw(configVersion string, supportedVersions []string) *ErrorIncompatible {
-	for _, supportedVersion := range supportedVersions {
-		if configVersion == supportedVersion {
+	for _, pluginVersion := range pluginVersions {
+		if configVersion == pluginVersion {
 			return nil
 		}
 	}
 
 	return &ErrorIncompatible{
-		Config:    configVersion,
-		Supported: supportedVersions,
+		Config: configVersion,
+		Plugin: pluginVersions,
 	}
 }
